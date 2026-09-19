@@ -4,7 +4,7 @@
 # ==============================================================================
 set -euo pipefail
 
-STORAGE_TARGET="${1:-r2:coolify-relay-state/coolify-state}"
+STORAGE_TARGET="${1:-b2:coolify-relay-state/coolify-state}"
 BACKUP_DIR="/data/coolify/backups"
 SOURCE_DIR="/data/coolify"
 
