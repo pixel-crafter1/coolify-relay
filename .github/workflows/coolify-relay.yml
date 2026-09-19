@@ -177,13 +177,18 @@ jobs:
           # Check if this is an automated rotation cycle awaiting predecessor sync flag
           if [ "${{ github.event.inputs.cycle_count }}" != "0" ]; then
             echo "Awaiting predecessor delta synchronization lock..."
-            for sec in {1..20}; do
+            FLAG_FOUND=false
+            for sec in {1..60}; do
               if rclone cat "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
-                echo "Predecessor sync_complete flag detected."
+                echo "Predecessor sync_complete flag detected ($((sec * 3))s)."
+                FLAG_FOUND=true
                 break
               fi
               sleep 3
             done
+            if [ "$FLAG_FOUND" != "true" ]; then
+              echo "::warning::Sync complete flag was not found within 180s. Proceeding with latest state in R2."
+            fi
           fi
 
           # Incremental delta pull, permission normalization, SSH host injection, and DB restore
@@ -326,15 +331,39 @@ jobs:
               fi
             fi
 
-            # Regular checkpoint delta sync every 15 minutes (Non-destructive, live containers untouched)
+            # Regular checkpoint delta sync every 15 minutes (Live container safe snapshots)
             if [ $((ELAPSED % 15)) -eq 0 ]; then
-              echo "[$(date +'%T')] Shift Progress: ${ELAPSED}/${HANDOVER_MINUTE}m | Performing incremental backup..."
+              echo "[$(date +'%T')] Shift Progress: ${ELAPSED}/${HANDOVER_MINUTE}m | Performing live periodic backup to R2..."
+              # 1. Stream PostgreSQL dump directly to R2
+              if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | gzip | rclone rcat "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+              fi
+              # 2. Stream Docker application volumes directly to R2
+              if [ -d "/var/lib/docker/volumes" ]; then
+                sudo tar -cpzf - -C /var/lib/docker/volumes --exclude="**/metadata.db" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
+              fi
+              # 3. Stream core /data/coolify configurations directly to R2
               sudo tar -cpzf - -C /data/coolify \
-                --exclude="proxy/certs/**" --exclude="**/*.log" . | rclone rcat "${TARGET}/coolify_bundle.tar.gz" 2>/dev/null || true
+                --exclude="proxy/certs/**" --exclude="**/*.log" --exclude="backups/*" . | rclone rcat "${TARGET}/coolify_bundle.tar.gz" 2>/dev/null || true
+              echo "[$(date +'%T')] Periodic backup completed."
             fi
           done
 
           echo "=== HANDOVER THRESHOLD REACHED (Minute ${HANDOVER_MINUTE}) ==="
+
+          # 1. First, perform the full freeze and delta sync BEFORE triggering the successor!
+          # This guarantees R2 has the latest database dump, volumes, and configs ready when the successor starts.
+          echo "Executing Final Freeze & Delta Sync..."
+          chmod +x scripts/coolify/sync_delta.sh || true
+          ./scripts/coolify/sync_delta.sh "$TARGET" || true
+
+          # 2. Release Cloudflare Tunnel connector BEFORE signaling completion
+          echo "Releasing Cloudflare Tunnel connector to prevent round-robin collision..."
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+
+          # 3. Mark delta sync complete flag in R2 so successor knows state is 100% ready
+          rclone touch "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+
           REPOS=(
             "ember-ops1/coolify-relay"
             "silver-weaver/coolify-relay"
@@ -380,23 +409,9 @@ jobs:
             dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "CRITICAL: All dispatches failed!"
           fi
 
-          echo "Successor dispatched! Awaiting Phase 1 pre-warm (180s)..."
-          sleep 180
-
-          echo "Executing Final Freeze & Delta Sync..."
-          chmod +x scripts/coolify/sync_delta.sh || true
-          ./scripts/coolify/sync_delta.sh "$TARGET" || true
-
-          # Release Cloudflare Tunnel connector BEFORE signaling completion
-          echo "Releasing Cloudflare Tunnel connector to prevent round-robin collision..."
-          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
-
-          # Signal successor to takeover
-          rclone touch "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
-
-          # Await successor handshake clearance (up to 3 minutes)
+          # 4. Await successor handshake clearance (up to 5 minutes)
           echo "Handshake flag set. Awaiting successor to acknowledge and claim state..."
-          for check in {1..36}; do
+          for check in {1..60}; do
             if ! rclone cat "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
               echo "Successor has claimed the delta flag! Exiting gracefully..."
               break
@@ -404,8 +419,8 @@ jobs:
             sleep 5
           done
 
-          echo "Handover complete! Outgoing node entering standby (max 5m)..."
-          for wait_min in {1..5}; do
+          echo "Handover complete! Outgoing node entering standby (max 2m)..."
+          for wait_min in {1..2}; do
             sleep 60
           done
           echo "Standby expired. Self-terminating to free runner concurrency."
@@ -421,5 +436,17 @@ jobs:
         run: |
           echo "=== PHASE 5: Teardown & Clean Exit ==="
           sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          TARGET="${STORAGE_TARGET:-r2:coolify-relay-state/coolify-state}"
+
+          # Emergency state preservation: If database container exists, dump Postgres before teardown
+          if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'coolify-db'; then
+            echo "[TEARDOWN] Emergency safety dump of PostgreSQL to R2..."
+            sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | gzip | rclone rcat "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+          fi
+          if [ -d "/var/lib/docker/volumes" ]; then
+            echo "[TEARDOWN] Emergency sync of Docker volumes to R2..."
+            sudo tar -cpzf - -C /var/lib/docker/volumes --exclude="**/metadata.db" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
+          fi
+
           (cd /data/coolify/source 2>/dev/null && sudo docker compose down -t 2) || true
           echo "Node shutdown clean."
