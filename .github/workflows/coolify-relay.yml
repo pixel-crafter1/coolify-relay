@@ -60,7 +60,7 @@ jobs:
             echo "Rclone credentials restored."
           fi
 
-          TARGET="${STORAGE_TARGET:-r2:coolify-relay-state/coolify-state}"
+          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
 
           # Baseline directory initialization
           sudo mkdir -p /data/coolify /var/lib/docker/volumes /etc/cloudflared
@@ -172,7 +172,7 @@ jobs:
           set -euo pipefail
           echo "=== PHASE 2 & 3: Handshake, State Hydration & Ingress Claim ==="
 
-          TARGET="${STORAGE_TARGET:-r2:coolify-relay-state/coolify-state}"
+          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
 
           # Check if this is an automated rotation cycle awaiting predecessor sync flag
           if [ "${{ github.event.inputs.cycle_count }}" != "0" ]; then
@@ -306,7 +306,7 @@ jobs:
             HANDOVER_MINUTE=$TEST_HANDOVER
           fi
 
-          TARGET="${STORAGE_TARGET:-r2:coolify-relay-state/coolify-state}"
+          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
           ELAPSED=0
 
           while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
@@ -436,7 +436,7 @@ jobs:
         run: |
           echo "=== PHASE 5: Teardown & Clean Exit ==="
           sudo pkill -SIGTERM cloudflared 2>/dev/null || true
-          TARGET="${STORAGE_TARGET:-r2:coolify-relay-state/coolify-state}"
+          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
 
           # Emergency state preservation: If database container exists, dump Postgres before teardown
           if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'coolify-db'; then
