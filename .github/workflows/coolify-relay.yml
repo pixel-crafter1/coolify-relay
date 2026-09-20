@@ -78,6 +78,15 @@ jobs:
           sudo docker pull postgres:15-alpine || sudo docker pull postgres:16-alpine || true
           sudo docker pull redis:7-alpine || sudo docker pull redis:alpine || true
 
+          # Universal Pre-Pull: Dynamically scan restored compose files for any user-deployed images
+          if [ -d "/data/coolify/applications" ] || [ -d "/data/coolify/services" ]; then
+            echo "Pre-pulling application images found in restored configurations..."
+            for cmp in $(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" 2>/dev/null || true); do
+              (cd "$(dirname "$cmp")" && sudo docker compose pull -q 2>/dev/null || true) &
+            done
+            wait
+          fi
+
           # If this is a completely fresh first run without existing state, install Coolify baseline
           if [ ! -f "/data/coolify/source/docker-compose.yml" ]; then
             echo "No prior state found. Bootstrapping official Coolify environment..."
