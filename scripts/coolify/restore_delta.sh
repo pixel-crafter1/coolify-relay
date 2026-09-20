@@ -108,17 +108,17 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
   echo "[COOLIFY-RESTORE] Ensuring external Docker network coolify exists..."
   sudo docker network create --attachable coolify 2>/dev/null || true
 
-  echo "[COOLIFY-RESTORE] Booting coolify-db container..."
+  echo "[COOLIFY-RESTORE] Booting postgres database service..."
   sudo docker compose --project-directory /data/coolify/source \
     --env-file /data/coolify/source/.env \
     -f /data/coolify/source/docker-compose.yml \
     -f /data/coolify/source/docker-compose.prod.yml \
-    up -d coolify-db 2>&1 || true
+    up -d postgres 2>&1 || true
 
   echo "[COOLIFY-RESTORE] Polling PostgreSQL daemon readiness via pg_isready..."
   DB_READY=false
   for i in {1..30}; do
-    if sudo docker exec coolify-db pg_isready -U coolify >/dev/null 2>&1; then
+    if sudo docker exec coolify-db pg_isready -U coolify >/dev/null 2>&1 || sudo docker exec -i coolify-db pg_isready >/dev/null 2>&1; then
       echo "[COOLIFY-RESTORE] PostgreSQL is fully ready and accepting connections! ($((i*2))s)"
       DB_READY=true
       break
