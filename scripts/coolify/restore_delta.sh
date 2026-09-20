@@ -206,9 +206,53 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
     sleep 2
   done
 
-  # Verify container state
-  echo "[COOLIFY-RESTORE] Active Docker containers:"
-  sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+  echo "[COOLIFY-RESTORE] State restoration & environment hardening complete!"
 fi
 
-echo "[COOLIFY-RESTORE] State restoration & environment hardening complete!"
+# ==============================================================================
+# SAFEGUARD 4: Universal Auto-Discovery, Image Pull & Startup for User Services
+# Works dynamically for ANY current or future service/application deployed in Coolify
+# ==============================================================================
+echo "[COOLIFY-RESTORE] Scanning for deployed Coolify applications and services..."
+
+COMPOSE_FILES=()
+while IFS= read -r -d '' file; do
+  COMPOSE_FILES+=("$file")
+done < <(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" -print0 2>/dev/null || true)
+
+if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
+  echo "[COOLIFY-RESTORE] Found ${#COMPOSE_FILES[@]} deployed service compose file(s)."
+  for compose in "${COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    echo "[COOLIFY-RESTORE] >> Inspecting service in $workdir..."
+
+    # Ensure env file exists if referenced
+    env_arg=""
+    if [ -f "$workdir/.env" ]; then
+      env_arg="--env-file $workdir/.env"
+    fi
+
+    # 1. Pull required images (in parallel/cached) so container starts immediately
+    echo "[COOLIFY-RESTORE] Pre-fetching Docker images for $workdir..."
+    (cd "$workdir" && sudo docker compose $env_arg -f "$compose" pull -q 2>/dev/null || true) &
+  done
+  wait
+
+  # 2. Boot up every discovered service stack
+  for compose in "${COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    echo "[COOLIFY-RESTORE] Starting service stack in $workdir..."
+    env_arg=""
+    if [ -f "$workdir/.env" ]; then
+      env_arg="--env-file $workdir/.env"
+    fi
+    (cd "$workdir" && sudo docker compose $env_arg -f "$compose" up -d --remove-orphans 2>&1 || true)
+  done
+else
+  echo "[COOLIFY-RESTORE] No deployed user applications found yet."
+fi
+
+# Final status check of all running containers
+echo "[COOLIFY-RESTORE] All active containers post-restore:"
+sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
