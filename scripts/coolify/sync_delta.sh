@@ -36,8 +36,16 @@ if [ -f "/data/coolify/source/db.sqlite" ]; then
 fi
 
 # 3. Stop containers cleanly to ensure transactional consistency
+# Pause/stop all active user containers so SQLite, JSON, chat histories, and file locks flush cleanly to disk
+echo "[COOLIFY-SYNC] Flushing and stopping active workloads cleanly..."
+for compose in $(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" 2>/dev/null || true); do
+  workdir=$(dirname "$compose")
+  env_arg=""
+  [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
+  (cd "$workdir" && sudo docker compose $env_arg -f "$compose" stop -t 5 2>/dev/null || true)
+done
+
 if [ -f "/data/coolify/source/docker-compose.yml" ]; then
-  echo "[COOLIFY-SYNC] Stopping write workloads cleanly..."
   (cd /data/coolify/source && sudo docker compose --env-file .env -f docker-compose.yml -f docker-compose.prod.yml stop -t 10 coolify coolify-db 2>/dev/null || \
    cd /data/coolify/source && sudo docker compose stop -t 10 coolify coolify-db 2>/dev/null || true)
 fi
