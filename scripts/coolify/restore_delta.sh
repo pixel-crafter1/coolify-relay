@@ -238,7 +238,22 @@ if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
   done
   wait
 
-  # 2. Boot up every discovered service stack
+  # 2. Automatically create external Docker networks required by Coolify services
+  # In Coolify, services declare external networks (e.g., the directory/UUID name and 'coolify')
+  echo "[COOLIFY-RESTORE] Ensuring all external networks required by user services exist..."
+  sudo docker network create --attachable coolify 2>/dev/null || true
+  for compose in "${COMPOSE_FILES[@]}"; do
+    workdir=$(dirname "$compose")
+    svc_uuid=$(basename "$workdir")
+    # Always create network named after the service/app UUID
+    sudo docker network create --attachable "$svc_uuid" 2>/dev/null || true
+    # Parse any other external networks declared in the compose file
+    for net in $(grep -B 2 'external: true' "$compose" 2>/dev/null | grep -E '^[[:space:]]+[a-zA-Z0-9_-]+:' | tr -d ' :' || true); do
+      [ -n "$net" ] && sudo docker network create --attachable "$net" 2>/dev/null || true
+    done
+  done
+
+  # 3. Boot up every discovered service stack
   for compose in "${COMPOSE_FILES[@]}"; do
     workdir=$(dirname "$compose")
     echo "[COOLIFY-RESTORE] Starting service stack in $workdir..."
