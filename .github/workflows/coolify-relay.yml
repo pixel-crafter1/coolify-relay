@@ -190,16 +190,16 @@ jobs:
           if [ "${{ github.event.inputs.cycle_count }}" != "0" ]; then
             echo "Awaiting predecessor delta synchronization lock..."
             FLAG_FOUND=false
-            for sec in {1..60}; do
+            for sec in {1..30}; do
               if rclone cat "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
-                echo "Predecessor sync_complete flag detected ($((sec * 3))s)."
+                echo "Predecessor sync_complete flag detected ($((sec * 6))s)."
                 FLAG_FOUND=true
                 break
               fi
-              sleep 3
+              sleep 6
             done
             if [ "$FLAG_FOUND" != "true" ]; then
-              echo "::warning::Sync complete flag was not found within 180s. Proceeding with latest state in R2."
+              echo "::warning::Sync complete flag was not found within 180s. Proceeding with latest state in B2."
             fi
           fi
 
@@ -347,19 +347,26 @@ jobs:
               fi
             fi
 
-            # Regular checkpoint delta sync every 15 minutes (Live container safe snapshots)
-            if [ $((ELAPSED % 15)) -eq 0 ]; then
-              echo "[$(date +'%T')] Shift Progress: ${ELAPSED}/${HANDOVER_MINUTE}m | Performing live periodic backup to R2..."
-              # 1. Stream PostgreSQL dump directly to R2
+            # Regular checkpoint delta sync every 30 minutes (Live container safe snapshots)
+            # 30-minute interval reduces daily B2 API calls by 50% while guaranteeing frequent recovery points
+            if [ $((ELAPSED % 30)) -eq 0 ]; then
+              echo "[$(date +'%T')] Shift Progress: ${ELAPSED}/${HANDOVER_MINUTE}m | Performing live periodic backup to B2..."
+              # 1. Stream PostgreSQL dump directly to B2
               if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
                 sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | gzip | rclone rcat "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
               fi
-              # 2. Stream Docker application volumes directly to R2
-              if [ -d "/var/lib/docker/volumes" ]; then
-                sudo tar -cpzf - -C /var/lib/docker/volumes --exclude="**/metadata.db" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
+              # 2. Stream Docker application volumes directly to B2 (excluding raw Postgres cluster files to prevent bloat)
+              if sudo test -d "/var/lib/docker/volumes"; then
+                sudo tar -cpzf - -C /var/lib/docker/volumes \
+                  --warning=no-file-changed \
+                  --exclude="**/metadata.db" \
+                  --exclude="*coolify-db-data*" \
+                  --exclude="*coolify-db*" \
+                  --exclude="*coolify_db*" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
               fi
-              # 3. Stream core /data/coolify configurations directly to R2
+              # 3. Stream core /data/coolify configurations directly to B2
               sudo tar -cpzf - -C /data/coolify \
+                --warning=no-file-changed \
                 --exclude="proxy/certs/**" --exclude="**/*.log" --exclude="backups/*" . | rclone rcat "${TARGET}/coolify_bundle.tar.gz" 2>/dev/null || true
               echo "[$(date +'%T')] Periodic backup completed."
             fi
@@ -460,9 +467,14 @@ jobs:
             echo "[TEARDOWN] Emergency safety dump of PostgreSQL to R2..."
             sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | gzip | rclone rcat "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
           fi
-          if [ -d "/var/lib/docker/volumes" ]; then
-            echo "[TEARDOWN] Emergency sync of Docker volumes to R2..."
-            sudo tar -cpzf - -C /var/lib/docker/volumes --exclude="**/metadata.db" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
+          if sudo test -d "/var/lib/docker/volumes"; then
+            echo "[TEARDOWN] Emergency sync of Docker volumes to B2..."
+            sudo tar -cpzf - -C /var/lib/docker/volumes \
+              --warning=no-file-changed \
+              --exclude="**/metadata.db" \
+              --exclude="*coolify-db-data*" \
+              --exclude="*coolify-db*" \
+              --exclude="*coolify_db*" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
           fi
 
           (cd /data/coolify/source 2>/dev/null && sudo docker compose down -t 2) || true
