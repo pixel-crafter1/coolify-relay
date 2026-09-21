@@ -66,11 +66,13 @@ if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
   rclone copyto "${BACKUP_DIR}/coolify_pg_latest.sql.gz" "${STORAGE_TARGET}/coolify_pg_latest.sql.gz"
 fi
 
-# 6. Stream Docker application volumes if any exist
-if [ -d "/var/lib/docker/volumes" ]; then
+# 6. Stream Docker application volumes if any exist (use sudo to inspect root-owned directory)
+if sudo test -d "/var/lib/docker/volumes"; then
   echo "[COOLIFY-SYNC] Streaming Docker application volumes to ${STORAGE_TARGET}/volumes_bundle.tar.gz..."
   sudo tar -cpzf - -C /var/lib/docker/volumes \
-    --exclude="**/metadata.db" . | rclone rcat "${STORAGE_TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
+    --exclude="**/metadata.db" . | rclone rcat "${STORAGE_TARGET}/volumes_bundle.tar.gz" || echo "[COOLIFY-SYNC] Warning: volumes tarball upload returned non-zero"
+else
+  echo "[COOLIFY-SYNC] No /var/lib/docker/volumes directory found."
 fi
 
 echo "[COOLIFY-SYNC] Backup to Backblaze B2 complete!"
