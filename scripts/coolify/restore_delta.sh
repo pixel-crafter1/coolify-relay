@@ -247,8 +247,27 @@ if [ ${#COMPOSE_FILES[@]} -gt 0 ]; then
     svc_uuid=$(basename "$workdir")
     # Always create network named after the service/app UUID
     sudo docker network create --attachable "$svc_uuid" 2>/dev/null || true
-    # Parse any other external networks declared in the compose file
-    for net in $(grep -B 2 'external: true' "$compose" 2>/dev/null | grep -E '^[[:space:]]+[a-zA-Z0-9_-]+:' | tr -d ' :' || true); do
+
+    # Native compose network discovery: inspects declared networks reliably regardless of YAML formatting
+    declared_nets=$(cd "$workdir" && sudo docker compose -f "$compose" config --networks 2>/dev/null || true)
+    for net in $declared_nets; do
+      if [ -n "$net" ] && [ "$net" != "default" ]; then
+        sudo docker network create --attachable "$net" 2>/dev/null || true
+      fi
+    done
+
+    # Fallback awk parser for raw external networks if docker compose config is not yet initialized
+    for net in $(awk '
+      /^networks:/ { in_net=1; next }
+      /^[a-zA-Z]/ && !/^networks:/ { in_net=0 }
+      in_net && /^  [a-zA-Z0-9_-]+:/ {
+        sub(/^  /, ""); sub(/:.*/, ""); curr=$0
+      }
+      in_net && curr != "" && /external:[[:space:]]*true/ {
+        if (curr != "external") print curr
+        curr=""
+      }
+    ' "$compose" 2>/dev/null || true); do
       [ -n "$net" ] && sudo docker network create --attachable "$net" 2>/dev/null || true
     done
   done
