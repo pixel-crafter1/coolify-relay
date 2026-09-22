@@ -211,11 +211,20 @@ fi
 
 # ==============================================================================
 # SAFEGUARD 3.5: Conflict Resolution & Stale Duplicate Cleanup
-# Automatically purges decommissioned duplicate containers/services (e.g. jlmfa7jdillwu9a9vfkh1hiz)
-# to prevent Traefik domain routing collisions and ghost services.
+# Consolidates code-server data into jxr4bhxlj2pgqn20fncu8cqc if an older volume exists,
+# and cleans up obsolete containers to prevent Traefik domain routing collisions.
 # ==============================================================================
+if [ -d "/var/lib/docker/volumes/jlmfa7jdillwu9a9vfkh1hiz_code-server-config" ]; then
+  echo "[COOLIFY-RESTORE] Found valuable workspace data in older volume jlmfa7jdillwu9a9vfkh1hiz. Migrating to jxr4bhxlj2pgqn20fncu8cqc..."
+  sudo mkdir -p /var/lib/docker/volumes/jxr4bhxlj2pgqn20fncu8cqc_code-server-config/_data
+  # Sync all user workspace files, claude sessions, chat history, and config without overwriting newer files
+  sudo cp -a -n /var/lib/docker/volumes/jlmfa7jdillwu9a9vfkh1hiz_code-server-config/_data/. /var/lib/docker/volumes/jxr4bhxlj2pgqn20fncu8cqc_code-server-config/_data/ 2>/dev/null || true
+  sudo chown -R 1000:1000 /var/lib/docker/volumes/jxr4bhxlj2pgqn20fncu8cqc_code-server-config/_data 2>/dev/null || true
+  echo "[COOLIFY-RESTORE] Workspace data migration complete!"
+fi
+
 if [ -d "/data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz" ]; then
-  echo "[COOLIFY-RESTORE] Detected stale duplicate service jlmfa7jdillwu9a9vfkh1hiz. Purging to prevent routing conflict..."
+  echo "[COOLIFY-RESTORE] Purging duplicate service definition jlmfa7jdillwu9a9vfkh1hiz to ensure clean routing to jxr4bhxlj2pgqn20fncu8cqc..."
   (cd /data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz && sudo docker compose down -v 2>/dev/null || true)
   sudo rm -rf "/data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz"
   sudo rm -rf /var/lib/docker/volumes/jlmfa7jdillwu9a9vfkh1hiz* 2>/dev/null || true
@@ -223,7 +232,7 @@ if [ -d "/data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz" ]; then
   if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
     sudo docker exec coolify-db psql -U coolify -d coolify -c "DELETE FROM services WHERE uuid = 'jlmfa7jdillwu9a9vfkh1hiz';" 2>/dev/null || true
   fi
-  echo "[COOLIFY-RESTORE] Stale duplicate jlmfa7jdillwu9a9vfkh1hiz purged."
+  echo "[COOLIFY-RESTORE] Duplicate service definition purged."
 fi
 
 # ==============================================================================
