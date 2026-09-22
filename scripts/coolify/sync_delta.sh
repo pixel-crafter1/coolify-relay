@@ -32,6 +32,7 @@ echo "[COOLIFY-SYNC] === Initiating Multi-Threaded State Dump & Google Drive Syn
 echo "[COOLIFY-SYNC] Target: ${STORAGE_TARGET} | Timestamp: ${TIMESTAMP}"
 
 sudo mkdir -p "$BACKUP_DIR" "$LOCAL_STAGE"
+sudo chmod 777 "$LOCAL_STAGE"
 sudo rm -rf "${LOCAL_STAGE:?}"/*
 
 # Ensure rclone configuration is available for both runner and root
