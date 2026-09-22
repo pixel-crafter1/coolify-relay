@@ -210,6 +210,23 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
 fi
 
 # ==============================================================================
+# SAFEGUARD 3.5: Conflict Resolution & Stale Duplicate Cleanup
+# Automatically purges decommissioned duplicate containers/services (e.g. jlmfa7jdillwu9a9vfkh1hiz)
+# to prevent Traefik domain routing collisions and ghost services.
+# ==============================================================================
+if [ -d "/data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz" ]; then
+  echo "[COOLIFY-RESTORE] Detected stale duplicate service jlmfa7jdillwu9a9vfkh1hiz. Purging to prevent routing conflict..."
+  (cd /data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz && sudo docker compose down -v 2>/dev/null || true)
+  sudo rm -rf "/data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz"
+  sudo rm -rf /var/lib/docker/volumes/jlmfa7jdillwu9a9vfkh1hiz* 2>/dev/null || true
+  # Remove from postgres if container exists
+  if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+    sudo docker exec coolify-db psql -U coolify -d coolify -c "DELETE FROM services WHERE uuid = 'jlmfa7jdillwu9a9vfkh1hiz';" 2>/dev/null || true
+  fi
+  echo "[COOLIFY-RESTORE] Stale duplicate jlmfa7jdillwu9a9vfkh1hiz purged."
+fi
+
+# ==============================================================================
 # SAFEGUARD 4: Universal Auto-Discovery, Image Pull & Startup for User Services
 # Works dynamically for ANY current or future service/application deployed in Coolify
 # ==============================================================================
