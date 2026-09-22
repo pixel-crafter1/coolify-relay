@@ -90,7 +90,9 @@ stream_tar_to_storage "/data/coolify" "${STORAGE_TARGET}/coolify_bundle.tar.gz" 
   --exclude="*/tmp/*" \
   --exclude="./backups/*" \
   --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz" \
-  --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz/*"
+  --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz/*" \
+  --exclude="./services/izmik1wbhrzpzwcub5uji2vv" \
+  --exclude="./services/izmik1wbhrzpzwcub5uji2vv/*"
 
 # 5. Backup standalone PostgreSQL dump for fast recovery
 if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
@@ -106,7 +108,8 @@ if sudo test -d "/var/lib/docker/volumes"; then
     --exclude="*coolify-db-data*" \
     --exclude="*coolify-db*" \
     --exclude="*coolify_db*" \
-    --exclude="*jlmfa7jdillwu9a9vfkh1hiz*"
+    --exclude="*jlmfa7jdillwu9a9vfkh1hiz*" \
+    --exclude="*izmik1wbhrzpzwcub5uji2vv*"
 else
   echo "[COOLIFY-SYNC] No /var/lib/docker/volumes directory found."
 fi
