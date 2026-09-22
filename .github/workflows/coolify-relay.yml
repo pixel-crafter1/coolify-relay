@@ -55,7 +55,8 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
 
           # Restore Rclone configuration
-          mkdir -p ~/.config/rclone /root/.config/rclone
+          mkdir -p ~/.config/rclone
+          sudo mkdir -p /root/.config/rclone
           if [ -n "$RCLONE_CONFIG_BASE64" ]; then
             echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
             sudo cp -f ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
