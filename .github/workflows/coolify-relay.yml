@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v4
 
       # =====================================================================
-      # PHASE 1: PRE-WARMING (Predecessor is active and handling live traffic)
+      # PHASE 1: PRE-WARMING & SYSTEM INITIALIZATION
       # =====================================================================
       - name: Bootstrap System, Dependencies & Pre-Warm State
         id: prewarm
@@ -38,13 +38,15 @@ jobs:
           CLONE_PAT: ${{ secrets.CLONE_PAT }}
           RCLONE_CONFIG_BASE64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           set -euo pipefail
           echo "=== PHASE 1: Pre-Warming System, Local Images & Baseline State ==="
+          CYCLE="${CYCLE_COUNT:-0}"
 
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            curl jq rclone netcat-openbsd sqlite3 dnsutils ca-certificates openssh-server
+            curl jq rclone pigz netcat-openbsd sqlite3 dnsutils ca-certificates openssh-server
 
           # Install cloudflared
           echo "Installing Cloudflare Tunnel client (cloudflared)..."
@@ -53,24 +55,71 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
 
           # Restore Rclone configuration
-          mkdir -p ~/.config/rclone
+          mkdir -p ~/.config/rclone /root/.config/rclone
           if [ -n "$RCLONE_CONFIG_BASE64" ]; then
             echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
-            chmod 600 ~/.config/rclone/rclone.conf
-            echo "Rclone credentials restored."
+            sudo cp -f ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
+            chmod 600 ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
+            echo "Rclone credentials restored for Google Drive."
+          else
+            echo "CRITICAL: RCLONE_CONFIG_BASE64 secret is missing!"
+            exit 1
           fi
 
-          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          sudo mkdir -p /data/coolify /var/lib/docker/volumes /etc/cloudflared /tmp/prewarm_cache
 
-          # Baseline directory initialization
-          sudo mkdir -p /data/coolify /var/lib/docker/volumes /etc/cloudflared
+          # Validate Google Drive Connectivity
+          echo "Probing Google Drive connectivity at ${TARGET}..."
+          if ! rclone lsf --fast-list "$TARGET" --max-depth 1 >/tmp/prewarm_ls.txt 2>&1; then
+            echo "CRITICAL: Google Drive connection failed during Phase 1 pre-warm!"
+            cat /tmp/prewarm_ls.txt
+            exit 1
+          fi
 
-          # Non-destructive pre-warming extraction (direct stream without ls calls)
-          rclone cat "${TARGET}/coolify_bundle.tar.gz" 2>/dev/null | sudo tar --numeric-owner -xpzf - -C /data/coolify 2>/dev/null || true
-          rclone cat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null | sudo tar --numeric-owner -xpzf - -C /var/lib/docker/volumes 2>/dev/null || true
+          # Fail-Closed Guard: For any cycle > 0, state recovery is mandatory
+          if [ "$CYCLE" != "0" ]; then
+            echo "Cycle ${CYCLE} detected. Enforcing mandatory state retrieval..."
+            if ! grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
+              echo "CRITICAL: Cycle is ${CYCLE} but 'coolify_bundle.tar.gz' is missing from Google Drive!"
+              echo "Halting pre-warm to prevent blank state overwrite."
+              exit 1
+            fi
+
+            echo "Fetching baseline bundles from Google Drive..."
+            rclone copy "$TARGET" /tmp/prewarm_cache \
+              --include "coolify_bundle.tar.gz" \
+              --include "volumes_bundle.tar.gz" \
+              --drive-chunk-size 128M \
+              --fast-list
+
+            if [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ]; then
+              echo "Decompressing core state with 4-core pigz..."
+              pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
+            fi
+            if [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ]; then
+              echo "Decompressing application volumes with 4-core pigz..."
+              pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
+            fi
+            rm -rf /tmp/prewarm_cache
+          else
+            # Cycle 0: Check if existing baseline exists on Google Drive
+            if grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
+              echo "Cycle 0 with existing Google Drive baseline detected. Hydrating..."
+              rclone copy "$TARGET" /tmp/prewarm_cache \
+                --include "coolify_bundle.tar.gz" \
+                --include "volumes_bundle.tar.gz" \
+                --drive-chunk-size 128M \
+                --fast-list
+
+              [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
+              [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
+              rm -rf /tmp/prewarm_cache
+            fi
+          fi
 
           # Pre-pull standard Coolify container images to eliminate takeover delay
-          echo "Pre-pulling core Coolify container images (latest)..."
+          echo "Pre-pulling core Coolify container images..."
           sudo docker network create --attachable coolify 2>/dev/null || true
           sudo docker pull ghcr.io/coollabsio/coolify:latest || true
           sudo docker pull ghcr.io/coollabsio/coolify-helper:latest || true
@@ -78,7 +127,7 @@ jobs:
           sudo docker pull postgres:15-alpine || sudo docker pull postgres:16-alpine || true
           sudo docker pull redis:7-alpine || sudo docker pull redis:alpine || true
 
-          # Universal Pre-Pull: Dynamically scan restored compose files for any user-deployed images
+          # Universal Pre-Pull: Dynamically scan restored compose files for user-deployed images
           if [ -d "/data/coolify/applications" ] || [ -d "/data/coolify/services" ]; then
             echo "Pre-pulling application images found in restored configurations..."
             for cmp in $(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" 2>/dev/null || true); do
@@ -87,9 +136,14 @@ jobs:
             wait
           fi
 
-          # If this is a completely fresh first run without existing state, install Coolify baseline
+          # Strict Fail-Closed Check: Never bootstrap blank install if cycle > 0
           if [ ! -f "/data/coolify/source/docker-compose.yml" ]; then
-            echo "No prior state found. Bootstrapping official Coolify environment..."
+            if [ "$CYCLE" != "0" ]; then
+              echo "CRITICAL ERROR: Cycle is ${CYCLE} but no compose files exist! Aborting to trigger Circuit Breaker."
+              exit 1
+            fi
+
+            echo "First-time installation authorized for Cycle 0. Bootstrapping Coolify..."
             curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash -s -- -f || true
 
             if [ -f "/data/coolify/source/.env" ]; then
@@ -99,7 +153,6 @@ jobs:
               fi
             fi
 
-            # Wait for background installation helper to initialize Docker containers
             echo "Awaiting Coolify container stack initialization..."
             for sec in {1..90}; do
               if sudo docker ps --format '{{.Names}}' | grep -q 'coolify'; then
@@ -156,42 +209,47 @@ jobs:
           PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
           FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
 
-          sleep 20
-          GH_TOKEN="$NEXT_PAT" gh workflow run coolify-relay.yml \
+          echo "Attempting primary dispatch to: ${PRIMARY_TARGET}..."
+          sleep 15
+          if ! GH_TOKEN="$NEXT_PAT" gh workflow run coolify-relay.yml \
             --repo "$PRIMARY_TARGET" \
             --ref main \
-            -f cycle_count="$CYCLE_COUNT" \
+            -f cycle_count="${CYCLE_COUNT:-0}" \
             -f retry_depth="$NEW_DEPTH" \
-            -f test_handover="${TEST_HANDOVER:-0}" || \
-          GH_TOKEN="$FALLBACK_PAT" gh workflow run coolify-relay.yml \
-            --repo "$FALLBACK_TARGET" \
-            --ref main \
-            -f cycle_count="$CYCLE_COUNT" \
-            -f retry_depth="$NEW_DEPTH" \
-            -f test_handover="${TEST_HANDOVER:-0}" || true
+            -f test_handover="${TEST_HANDOVER:-0}"; then
+            echo "Primary dispatch failed. Activating secondary fallback: ${FALLBACK_TARGET}..."
+            sleep 10
+            GH_TOKEN="$FALLBACK_PAT" gh workflow run coolify-relay.yml \
+              --repo "$FALLBACK_TARGET" \
+              --ref main \
+              -f cycle_count="${CYCLE_COUNT:-0}" \
+              -f retry_depth="$NEW_DEPTH" \
+              -f test_handover="${TEST_HANDOVER:-0}" || echo "CRITICAL: All fallback dispatches failed!"
+          fi
 
           exit 1
 
       # =====================================================================
-      # PHASE 2 & 3: HANDSHAKE, DELTA INGESTION & TAKEOVER
+      # PHASE 2 & 3: HANDSHAKE, DELTA INGESTION & INGRESS TAKEOVER
       # =====================================================================
       - name: Handshake, State Hydration & Cloudflare Ingress Takeover
         env:
           PREV_PAT: ${{ secrets.PREV_PAT }}
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           set -euo pipefail
           echo "=== PHASE 2 & 3: Handshake, State Hydration & Ingress Claim ==="
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          CYCLE="${CYCLE_COUNT:-0}"
 
-          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
-
-          # Check if this is an automated rotation cycle awaiting predecessor sync flag
-          if [ "${{ github.event.inputs.cycle_count }}" != "0" ]; then
-            echo "Awaiting predecessor delta synchronization lock..."
+          # If rotation cycle > 0, await predecessor sync_complete.flag
+          if [ "$CYCLE" != "0" ]; then
+            echo "Awaiting predecessor delta synchronization flag on Google Drive..."
             FLAG_FOUND=false
             for sec in {1..30}; do
-              if rclone cat "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
+              if rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
                 echo "Predecessor sync_complete flag detected ($((sec * 6))s)."
                 FLAG_FOUND=true
                 break
@@ -199,78 +257,57 @@ jobs:
               sleep 6
             done
             if [ "$FLAG_FOUND" != "true" ]; then
-              echo "::warning::Sync complete flag was not found within 180s. Proceeding with latest state in B2."
+              echo "::warning::Sync complete flag timed out after 180s. Proceeding with latest verified state."
             fi
           fi
 
-          # Incremental delta pull, permission normalization, SSH host injection, and DB restore
-          chmod +x scripts/coolify/restore_delta.sh || true
-          ./scripts/coolify/restore_delta.sh "$TARGET" || true
+          # Hydrate state using hardened fail-closed restore script
+          chmod +x scripts/coolify/restore_delta.sh
+          ./scripts/coolify/restore_delta.sh "$TARGET" "$CYCLE"
 
           # Clear handshake flag
-          rclone delete "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
-          # Start Cloudflare Tunnel connector with local wildcard ingress configuration
+          # Launch Cloudflare Tunnel connector with local wildcard ingress config
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-            echo "Configuring Cloudflare Tunnel with local wildcard ingress (*.justsawyou.cyou)..."
+            echo "Configuring local Cloudflare Tunnel credentials and wildcard ingress..."
             sudo mkdir -p /etc/cloudflared
-
-            # Safely generate /etc/cloudflared/credentials.json from CLOUDFLARE_TUNNEL_TOKEN
-            python3 -c "import os, base64, json; token = os.environ.get('CLOUDFLARE_TUNNEL_TOKEN', '').strip(); raw = json.loads(base64.b64decode(token)) if token else {}; creds = {'AccountTag': raw.get('a', ''), 'TunnelID': raw.get('t', ''), 'TunnelSecret': raw.get('s', '')}; open('/tmp/credentials.json', 'w').write(json.dumps(creds)) if creds.get('TunnelID') else None"
+            python3 -c "
+import os, base64, json
+token = os.environ.get('CLOUDFLARE_TUNNEL_TOKEN', '').strip()
+if token:
+    raw = json.loads(base64.b64decode(token))
+    creds = {
+        'AccountTag': raw.get('a', ''),
+        'TunnelID': raw.get('t', ''),
+        'TunnelSecret': raw.get('s', '')
+    }
+    with open('/tmp/credentials.json', 'w') as f:
+        json.dump(creds, f)
+"
             sudo mv -f /tmp/credentials.json /etc/cloudflared/credentials.json
             sudo chmod 600 /etc/cloudflared/credentials.json
-
-            # Copy verified repository wildcard ingress configuration
             sudo cp -f configs/cloudflared/config.yml /etc/cloudflared/config.yml
             sudo chmod 600 /etc/cloudflared/config.yml
 
-            echo "Validating cloudflared ingress configuration..."
-            sudo cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate || true
-
-            echo "Launching local-config cloudflared daemon..."
+            echo "Starting Cloudflare Tunnel daemon..."
             sudo cloudflared tunnel --config /etc/cloudflared/config.yml run > /tmp/cloudflared.log 2>&1 &
-            sleep 4
+            sleep 5
 
-            # Verify Coolify dashboard readiness on port 8000
-            echo "Verifying Coolify dashboard responsiveness on port 8000..."
+            echo "Awaiting local Coolify dashboard (port 8000)..."
             COOLIFY_UP=false
-            for chk in {1..60}; do
+            for chk in {1..45}; do
               if curl -fsS -o /dev/null --connect-timeout 2 http://localhost:8000; then
-                echo "SUCCESS: Coolify dashboard is alive and responding on port 8000! ($((chk*2))s)"
+                echo "SUCCESS: Coolify dashboard is responding on port 8000 ($((chk*2))s)."
                 COOLIFY_UP=true
                 break
               fi
               sleep 2
             done
-
-            if [ "$COOLIFY_UP" != "true" ]; then
-              echo "::warning::Coolify port 8000 not responding yet. Inspecting Docker containers:"
-              sudo docker ps -a
-            fi
-
-            # Export diagnostic snapshot to B2 for instant debugging
-            echo "Uploading diagnostics to B2..."
-            mkdir -p /tmp/diag
-            {
-              echo "=== DOCKER CONTAINERS ==="
-              sudo docker ps -a
-              echo "=== COOLIFY COMPOSE STATUS ==="
-              (sudo docker compose --project-directory /data/coolify/source --env-file /data/coolify/source/.env -f /data/coolify/source/docker-compose.yml -f /data/coolify/source/docker-compose.prod.yml ps -a) 2>&1 || true
-              echo "=== COOLIFY LOGS ==="
-              sudo docker logs --tail 100 coolify 2>&1 || true
-              echo "=== COOLIFY-DB LOGS ==="
-              sudo docker logs --tail 50 coolify-db 2>&1 || true
-              echo "=== CLOUDFLARED LOGS ==="
-              cat /tmp/cloudflared.log 2>&1 || true
-              echo "=== NETWORK LISTENERS ==="
-              sudo ss -tulpn 2>&1 || sudo netstat -tulpn 2>&1 || true
-            } > /tmp/diag/diagnostics.txt
-            rclone copyto /tmp/diag/diagnostics.txt "${TARGET}/diagnostics.txt" 2>/dev/null || true
-          else
-            echo "::warning::CLOUDFLARE_TUNNEL_TOKEN not provided; skipping tunnel launch."
+            [ "$COOLIFY_UP" != "true" ] && sudo docker ps -a
           fi
 
-          # Cancel predecessor runner run to release concurrency immediately
+          # Cancel predecessor runner run to release GitHub concurrency
           REPOS=(
             "ember-ops1/coolify-relay"
             "silver-weaver/coolify-relay"
@@ -288,13 +325,10 @@ jobs:
           if [ $CURRENT_INDEX -ge 0 ] && [ -n "$PREV_PAT" ]; then
             PREV_INDEX=$(( (CURRENT_INDEX - 1 + ${#REPOS[@]}) % ${#REPOS[@]} ))
             PREV_REPO="${REPOS[$PREV_INDEX]}"
-            echo "Checking predecessor repo: ${PREV_REPO}..."
-
+            echo "Cancelling predecessor active run on ${PREV_REPO}..."
             PREV_RUN_ID=$(GH_TOKEN="$PREV_PAT" gh run list --repo "$PREV_REPO" \
               --json databaseId,status -q '.[] | select(.status=="in_progress") | .databaseId' 2>/dev/null | head -n 1 || echo "")
-
             if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "null" ]; then
-              echo "Cancelling predecessor run #${PREV_RUN_ID} on ${PREV_REPO}..."
               GH_TOKEN="$PREV_PAT" gh run cancel "$PREV_RUN_ID" --repo "$PREV_REPO" 2>/dev/null || true
             fi
           fi
@@ -314,79 +348,53 @@ jobs:
           echo "=== PHASE 4: Production Shift Active ==="
           HANDOVER_MINUTE=330
           if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
-            echo ">>> TEST HANDOVER OVERRIDE: ${TEST_HANDOVER} minute(s) <<<"
             HANDOVER_MINUTE=$TEST_HANDOVER
           fi
 
-          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          CYCLE="${CYCLE_COUNT:-0}"
           ELAPSED=0
 
           while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
             sleep 60
             ELAPSED=$((ELAPSED + 1))
 
-            # Continuous SSH Key Synchronization from Coolify container / volume into host authorized_keys
-            # Ensures newly generated or uploaded keys inside Coolify are immediately valid on the host
+            # Maintain SSH key synchronization
             sudo docker exec coolify cat /var/www/html/storage/app/ssh/keys/id_ed25519.pub 2>/dev/null | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null || true
-            sudo docker exec coolify cat /var/www/html/storage/app/ssh/keys/id_rsa.pub 2>/dev/null | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null || true
-            if [ -d "/data/coolify/ssh/keys" ]; then
-              for pub in /data/coolify/ssh/keys/*.pub; do
-                [ -f "$pub" ] && sudo cat "$pub" | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null || true
-              done
-            fi
 
-            # Periodic Traefik & Coolify Health Check
+            # Coolify health check every 2 minutes
             if [ $((ELAPSED % 2)) -eq 0 ]; then
               if ! curl -fsS --connect-timeout 2 http://localhost:8000 >/dev/null 2>&1; then
-                echo "[$(date +'%T')] Warning: Local Coolify dashboard unreachable at minute ${ELAPSED}. Booting/recovering container stack..."
-                (cd /data/coolify/source && sudo docker network create --attachable coolify 2>/dev/null || true)
+                echo "[$(date +'%T')] Warning: Local Coolify dashboard unreachable at minute ${ELAPSED}. Recovering container stack..."
                 (cd /data/coolify/source && sudo docker compose --env-file .env -f docker-compose.yml -f docker-compose.prod.yml up -d 2>&1 || true)
-                if [ -d "/data/coolify/proxy" ] && [ -f "/data/coolify/proxy/docker-compose.yml" ]; then
-                  (cd /data/coolify/proxy && sudo docker compose -f docker-compose.yml up -d 2>/dev/null || true)
-                fi
               fi
             fi
 
-            # Regular checkpoint delta sync every 30 minutes (Live container safe snapshots)
-            # 30-minute interval reduces daily B2 API calls by 50% while guaranteeing frequent recovery points
+            # Checkpoint backup every 30 minutes with 4-core pigz
             if [ $((ELAPSED % 30)) -eq 0 ]; then
-              echo "[$(date +'%T')] Shift Progress: ${ELAPSED}/${HANDOVER_MINUTE}m | Performing live periodic backup to B2..."
-              # 1. Stream PostgreSQL dump directly to B2
+              echo "[$(date +'%T')] Minute ${ELAPSED}: Executing periodic SQL checkpoint to Google Drive..."
               if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | gzip | rclone rcat "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 | \
+                  rclone rcat --drive-chunk-size=128M --drive-use-trash=false "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
               fi
-              # 2. Stream Docker application volumes directly to B2 (excluding raw Postgres cluster files to prevent bloat)
-              if sudo test -d "/var/lib/docker/volumes"; then
-                sudo tar -cpzf - -C /var/lib/docker/volumes \
-                  --warning=no-file-changed \
-                  --exclude="**/metadata.db" \
-                  --exclude="*coolify-db-data*" \
-                  --exclude="*coolify-db*" \
-                  --exclude="*coolify_db*" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
-              fi
-              # 3. Stream core /data/coolify configurations directly to B2
-              sudo tar -cpzf - -C /data/coolify \
-                --warning=no-file-changed \
-                --exclude="proxy/certs/**" --exclude="**/*.log" --exclude="backups/*" . | rclone rcat "${TARGET}/coolify_bundle.tar.gz" 2>/dev/null || true
-              echo "[$(date +'%T')] Periodic backup completed."
             fi
           done
 
-          echo "=== HANDOVER THRESHOLD REACHED (Minute ${HANDOVER_MINUTE}) ==="
+          echo "=== HANDOVER THRESHOLD REACHED (${HANDOVER_MINUTE}m) ==="
 
-          # 1. First, perform the full freeze and delta sync BEFORE triggering the successor!
-          # This guarantees R2 has the latest database dump, volumes, and configs ready when the successor starts.
-          echo "Executing Final Freeze & Delta Sync..."
-          chmod +x scripts/coolify/sync_delta.sh || true
-          ./scripts/coolify/sync_delta.sh "$TARGET" || true
+          # 1. Execute Atomic Delta Freeze & Upload to Google Drive
+          echo "Executing Multi-Core Delta Freeze & Sync..."
+          chmod +x scripts/coolify/sync_delta.sh
+          ./scripts/coolify/sync_delta.sh "$TARGET"
 
-          # 2. Release Cloudflare Tunnel connector BEFORE signaling completion
-          echo "Releasing Cloudflare Tunnel connector to prevent round-robin collision..."
+          # 2. Release Cloudflare Tunnel connector to prevent traffic collision
+          echo "Releasing Cloudflare Tunnel connector..."
           sudo pkill -SIGTERM cloudflared 2>/dev/null || true
 
-          # 3. Mark delta sync complete flag in R2 so successor knows state is 100% ready
-          rclone touch "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          # 3. Create synchronization flag on Google Drive
+          rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
+          # 4. Dispatch successor runner across the ring
           REPOS=(
             "ember-ops1/coolify-relay"
             "silver-weaver/coolify-relay"
@@ -406,7 +414,7 @@ jobs:
           FALLBACK_INDEX=$(( (CURRENT_INDEX + 2) % ${#REPOS[@]} ))
           PRIMARY_TARGET="${REPOS[$NEXT_INDEX]}"
           FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
-          NEXT_CYCLE=$((CYCLE_COUNT + 1))
+          NEXT_CYCLE=$((CYCLE + 1))
 
           dispatch_runner() {
             local target="$1"
@@ -433,21 +441,16 @@ jobs:
             dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "CRITICAL: All dispatches failed!"
           fi
 
-          # 4. Await successor handshake clearance (up to 5 minutes)
-          echo "Handshake flag set. Awaiting successor to acknowledge and claim state..."
+          # 5. Await successor handshake claim
+          echo "Awaiting successor to claim delta flag on Google Drive..."
           for check in {1..60}; do
-            if ! rclone cat "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
-              echo "Successor has claimed the delta flag! Exiting gracefully..."
+            if ! rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
+              echo "Successor has claimed state. Exiting cleanly..."
               break
             fi
             sleep 5
           done
 
-          echo "Handover complete! Outgoing node entering standby (max 2m)..."
-          for wait_min in {1..2}; do
-            sleep 60
-          done
-          echo "Standby expired. Self-terminating to free runner concurrency."
           exit 0
 
       # =====================================================================
@@ -455,27 +458,7 @@ jobs:
       # =====================================================================
       - name: Final Teardown Safety Check
         if: always()
-        env:
-          STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
         run: |
-          echo "=== PHASE 5: Teardown & Clean Exit ==="
+          echo "=== PHASE 5: Teardown ==="
           sudo pkill -SIGTERM cloudflared 2>/dev/null || true
-          TARGET="${STORAGE_TARGET:-b2:coolify-relay-state/coolify-state}"
-
-          # Emergency state preservation: If database container exists, dump Postgres before teardown
-          if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'coolify-db'; then
-            echo "[TEARDOWN] Emergency safety dump of PostgreSQL to R2..."
-            sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | gzip | rclone rcat "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
-          fi
-          if sudo test -d "/var/lib/docker/volumes"; then
-            echo "[TEARDOWN] Emergency sync of Docker volumes to B2..."
-            sudo tar -cpzf - -C /var/lib/docker/volumes \
-              --warning=no-file-changed \
-              --exclude="**/metadata.db" \
-              --exclude="*coolify-db-data*" \
-              --exclude="*coolify-db*" \
-              --exclude="*coolify_db*" . | rclone rcat "${TARGET}/volumes_bundle.tar.gz" 2>/dev/null || true
-          fi
-
           (cd /data/coolify/source 2>/dev/null && sudo docker compose down -t 2) || true
-          echo "Node shutdown clean."
