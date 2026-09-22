@@ -1,17 +1,38 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Coolify Delta State Backup & Database Snapshot Script for Backblaze B2
-# Safely dumps PostgreSQL, pauses write containers, and streams tarball snapshots
-# to preserve exact Linux permissions (0600/0700), UIDs, symlinks, and DB state.
+# Coolify Delta State Backup & Snapshot Script for Google Drive (16GB / 4 vCPU)
+# Implements 4-core pigz compression, two-phase atomic staging, and deduplication.
 # ==============================================================================
 set -euo pipefail
 
-STORAGE_TARGET="${1:-b2:coolify-relay-state/coolify-state}"
+STORAGE_TARGET="${1:-gdrive:coolify-relay-state/coolify-state}"
 BACKUP_DIR="/data/coolify/backups"
-SOURCE_DIR="/data/coolify"
+LOCAL_STAGE="/tmp/coolify_sync_stage"
+TIMESTAMP=$(date -u +"%Y-%m-%d_%H%M%S")
 
-sudo mkdir -p "$BACKUP_DIR"
-sudo chown -R runner:docker "$BACKUP_DIR" 2>/dev/null || sudo chmod 777 "$BACKUP_DIR"
+# Tuned Rclone flags for Google Drive on 16GB RAM / 4 vCPU runners
+RCLONE_OPTS=(
+  "--drive-chunk-size=128M"
+  "--drive-upload-cutoff=128M"
+  "--drive-use-trash=false"
+  "--fast-list"
+  "--transfers=4"
+  "--checkers=8"
+  "--retries=6"
+  "--retries-sleep=10s"
+  "--timeout=10m"
+  "--contimeout=30s"
+  "--drive-pacer-min-sleep=100ms"
+  "--checksum"
+  "--stats=15s"
+  "--stats-one-line"
+)
+
+echo "[COOLIFY-SYNC] === Initiating Multi-Threaded State Dump & Google Drive Sync ==="
+echo "[COOLIFY-SYNC] Target: ${STORAGE_TARGET} | Timestamp: ${TIMESTAMP}"
+
+sudo mkdir -p "$BACKUP_DIR" "$LOCAL_STAGE"
+sudo rm -rf "${LOCAL_STAGE:?}"/*
 
 # Ensure rclone configuration is available for both runner and root
 if [ -f "$HOME/.config/rclone/rclone.conf" ]; then
@@ -19,13 +40,25 @@ if [ -f "$HOME/.config/rclone/rclone.conf" ]; then
   sudo cp -f "$HOME/.config/rclone/rclone.conf" /root/.config/rclone/rclone.conf
 fi
 
-echo "[COOLIFY-SYNC] === Initiating Atomic State Dump & B2 Backup ==="
+# Cleanup trap to ensure local staging area is removed on exit
+cleanup() {
+  rm -rf "$LOCAL_STAGE" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # 1. Check if Coolify DB container is running and dump PostgreSQL atomically
 if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-  echo "[COOLIFY-SYNC] Dumping PostgreSQL database (coolify-db)..."
-  sudo docker exec coolify-db pg_dumpall -U coolify --clean | gzip > "${BACKUP_DIR}/coolify_pg_latest.sql.gz"
-  echo "[COOLIFY-SYNC] DB dump complete: $(du -sh ${BACKUP_DIR}/coolify_pg_latest.sql.gz | cut -f1)"
+  echo "[COOLIFY-SYNC] Dumping PostgreSQL database (coolify-db) with 4-core pigz..."
+  sudo docker exec coolify-db pg_dumpall -U coolify --clean | pigz -p 4 -6 > "${LOCAL_STAGE}/coolify_pg_latest.sql.gz"
+
+  # Integrity check on SQL dump (>1KB)
+  DUMP_SIZE=$(stat -c%s "${LOCAL_STAGE}/coolify_pg_latest.sql.gz" 2>/dev/null || stat -f%z "${LOCAL_STAGE}/coolify_pg_latest.sql.gz" || echo 0)
+  if [ "$DUMP_SIZE" -lt 1024 ]; then
+    echo "[COOLIFY-SYNC] CRITICAL: PostgreSQL dump is abnormally small ($DUMP_SIZE bytes). Aborting sync!"
+    exit 1
+  fi
+  echo "[COOLIFY-SYNC] DB dump complete: $(du -sh ${LOCAL_STAGE}/coolify_pg_latest.sql.gz | cut -f1)"
+  cp -f "${LOCAL_STAGE}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz"
 fi
 
 # 2. Check for SQLite databases if any auxiliary services use it
@@ -36,7 +69,6 @@ if [ -f "/data/coolify/source/db.sqlite" ]; then
 fi
 
 # 3. Stop containers cleanly to ensure transactional consistency
-# Pause/stop all active user containers so SQLite, JSON, chat histories, and file locks flush cleanly to disk
 echo "[COOLIFY-SYNC] Flushing and stopping active workloads cleanly..."
 for compose in $(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" 2>/dev/null || true); do
   workdir=$(dirname "$compose")
@@ -50,40 +82,11 @@ if [ -f "/data/coolify/source/docker-compose.yml" ]; then
    cd /data/coolify/source && sudo docker compose stop -t 10 coolify coolify-db 2>/dev/null || true)
 fi
 
-# Robust tar-to-rclone streaming helper:
-# In Linux, tar returns exit code 1 if a file changed/was read while archiving (harmless warning).
-# Under 'set -e' and 'pipefail', exit code 1 terminates the entire script.
-# This function permits exit code 0 and 1, but strictly errors on exit code >= 2 (fatal tar errors)
-# or when rclone itself fails.
-stream_tar_to_storage() {
-  local source_path="$1"
-  local remote_dest="$2"
-  shift 2
-  local exclude_args=("$@")
-
-  set +e
-  sudo tar -cpzf - -C "$source_path" --warning=no-file-changed "${exclude_args[@]}" . | rclone rcat "$remote_dest"
-  local p_status=("${PIPESTATUS[@]}")
-  set -e
-
-  local tar_rc="${p_status[0]:-0}"
-  local rclone_rc="${p_status[1]:-0}"
-
-  if [ "$tar_rc" -gt 1 ]; then
-    echo "[COOLIFY-SYNC] Error: tar failed with critical code $tar_rc on $source_path"
-    return "$tar_rc"
-  fi
-  if [ "$rclone_rc" -ne 0 ]; then
-    echo "[COOLIFY-SYNC] Error: rclone rcat failed with code $rclone_rc to $remote_dest"
-    return "$rclone_rc"
-  fi
-  return 0
-}
-
-# 4. Stream /data/coolify as a single compressed tarball directly to Backblaze B2
-# Preserves Linux file permissions (0600/0700 SSH keys), symlinks, and UIDs.
-echo "[COOLIFY-SYNC] Streaming compressed /data/coolify bundle to ${STORAGE_TARGET}/coolify_bundle.tar.gz..."
-stream_tar_to_storage "/data/coolify" "${STORAGE_TARGET}/coolify_bundle.tar.gz" \
+# 4. Multi-core compression of /data/coolify to local staging
+echo "[COOLIFY-SYNC] Compressing /data/coolify with pigz (4 cores)..."
+set +e
+sudo tar -cpf - -C /data/coolify \
+  --warning=no-file-changed \
   --exclude="./proxy/certs" \
   --exclude="./proxy/certs/*" \
   --exclude="*.log" \
@@ -92,26 +95,100 @@ stream_tar_to_storage "/data/coolify" "${STORAGE_TARGET}/coolify_bundle.tar.gz" 
   --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz" \
   --exclude="./services/jlmfa7jdillwu9a9vfkh1hiz/*" \
   --exclude="./services/izmik1wbhrzpzwcub5uji2vv" \
-  --exclude="./services/izmik1wbhrzpzwcub5uji2vv/*"
+  --exclude="./services/izmik1wbhrzpzwcub5uji2vv/*" . | pigz -p 4 -6 > "${LOCAL_STAGE}/coolify_bundle.tar.gz"
+TAR_COOLIFY_RC=$?
+set -e
 
-# 5. Backup standalone PostgreSQL dump for fast recovery
-if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
-  echo "[COOLIFY-SYNC] Uploading standalone DB dump to B2..."
-  rclone copyto "${BACKUP_DIR}/coolify_pg_latest.sql.gz" "${STORAGE_TARGET}/coolify_pg_latest.sql.gz"
+if [ "$TAR_COOLIFY_RC" -gt 1 ]; then
+  echo "[COOLIFY-SYNC] Fatal tar error on /data/coolify: $TAR_COOLIFY_RC"
+  exit "$TAR_COOLIFY_RC"
 fi
 
-# 6. Stream Docker application volumes if any exist (excluding coolify-db raw files to prevent double-restore conflicts & bloat)
+# Verify archive integrity locally
+if ! pigz -t "${LOCAL_STAGE}/coolify_bundle.tar.gz" >/dev/null 2>&1; then
+  echo "[COOLIFY-SYNC] FATAL: Generated coolify_bundle.tar.gz failed integrity check!"
+  exit 1
+fi
+echo "[COOLIFY-SYNC] /data/coolify packed: $(du -sh ${LOCAL_STAGE}/coolify_bundle.tar.gz | cut -f1)"
+
+# 5. Multi-core compression of /var/lib/docker/volumes to local staging
 if sudo test -d "/var/lib/docker/volumes"; then
-  echo "[COOLIFY-SYNC] Streaming Docker application volumes to ${STORAGE_TARGET}/volumes_bundle.tar.gz..."
-  stream_tar_to_storage "/var/lib/docker/volumes" "${STORAGE_TARGET}/volumes_bundle.tar.gz" \
+  echo "[COOLIFY-SYNC] Compressing /var/lib/docker/volumes with pigz (4 cores)..."
+  set +e
+  sudo tar -cpf - -C /var/lib/docker/volumes \
+    --warning=no-file-changed \
     --exclude="**/metadata.db" \
     --exclude="*coolify-db-data*" \
     --exclude="*coolify-db*" \
     --exclude="*coolify_db*" \
     --exclude="*jlmfa7jdillwu9a9vfkh1hiz*" \
-    --exclude="*izmik1wbhrzpzwcub5uji2vv*"
-else
-  echo "[COOLIFY-SYNC] No /var/lib/docker/volumes directory found."
+    --exclude="*izmik1wbhrzpzwcub5uji2vv*" \
+    --exclude="**/node_modules" \
+    --exclude="**/node_modules/**" \
+    --exclude="**/.npm/**" \
+    --exclude="**/.cache/**" \
+    --exclude="**/__pycache__" \
+    --exclude="**/__pycache__/**" \
+    --exclude="**/*.pyc" \
+    --exclude="**/.next/cache/**" . | pigz -p 4 -6 > "${LOCAL_STAGE}/volumes_bundle.tar.gz"
+  TAR_VOL_RC=$?
+  set -e
+
+  if [ "$TAR_VOL_RC" -gt 1 ]; then
+    echo "[COOLIFY-SYNC] Fatal tar error on volumes: $TAR_VOL_RC"
+    exit "$TAR_VOL_RC"
+  fi
+
+  if ! pigz -t "${LOCAL_STAGE}/volumes_bundle.tar.gz" >/dev/null 2>&1; then
+    echo "[COOLIFY-SYNC] FATAL: Generated volumes_bundle.tar.gz failed integrity check!"
+    exit 1
+  fi
+  echo "[COOLIFY-SYNC] Volumes packed: $(du -sh ${LOCAL_STAGE}/volumes_bundle.tar.gz | cut -f1)"
 fi
 
-echo "[COOLIFY-SYNC] Backup to Backblaze B2 complete!"
+# 6. Generate SHA256 integrity manifest
+echo "[COOLIFY-SYNC] Generating SHA256 checksums..."
+(cd "$LOCAL_STAGE" && sha256sum *.tar.gz *.sql.gz > checksums.sha256 2>/dev/null || sha256sum *.tar.gz > checksums.sha256)
+
+# 7. Two-Phase Atomic Staging: Upload to Google Drive remote staging directory
+RUN_TAG="run_${GITHUB_RUN_ID:-$$}"
+REMOTE_STAGE="${STORAGE_TARGET}/staging/${RUN_TAG}"
+
+echo "[COOLIFY-SYNC] Phase 1: Uploading archives to remote staging (${REMOTE_STAGE})..."
+rclone copy "${RCLONE_OPTS[@]}" "$LOCAL_STAGE" "$REMOTE_STAGE"
+
+# 8. Verify upload integrity against remote
+echo "[COOLIFY-SYNC] Phase 2: Verifying staged files on Google Drive..."
+rclone check "${RCLONE_OPTS[@]}" "$LOCAL_STAGE" "$REMOTE_STAGE" --one-way
+
+# 9. Server-Side Promotion: Atomically copy staged files to primary target
+echo "[COOLIFY-SYNC] Phase 3: Promoting staged files to primary root on Google Drive..."
+rclone copyto "${RCLONE_OPTS[@]}" "${REMOTE_STAGE}/coolify_bundle.tar.gz" "${STORAGE_TARGET}/coolify_bundle.tar.gz"
+if [ -f "${LOCAL_STAGE}/volumes_bundle.tar.gz" ]; then
+  rclone copyto "${RCLONE_OPTS[@]}" "${REMOTE_STAGE}/volumes_bundle.tar.gz" "${STORAGE_TARGET}/volumes_bundle.tar.gz"
+fi
+if [ -f "${LOCAL_STAGE}/coolify_pg_latest.sql.gz" ]; then
+  rclone copyto "${RCLONE_OPTS[@]}" "${REMOTE_STAGE}/coolify_pg_latest.sql.gz" "${STORAGE_TARGET}/coolify_pg_latest.sql.gz"
+fi
+rclone copyto "${RCLONE_OPTS[@]}" "${REMOTE_STAGE}/checksums.sha256" "${STORAGE_TARGET}/checksums.sha256"
+
+# 10. Clean up remote staging directory
+rclone purge "${RCLONE_OPTS[@]}" "$REMOTE_STAGE" 2>/dev/null || true
+
+# 11. Eliminate duplicate file entries on Google Drive
+echo "[COOLIFY-SYNC] Running Google Drive deduplication..."
+rclone dedupe "${RCLONE_OPTS[@]}" --dedupe-mode newest "${STORAGE_TARGET}" 2>/dev/null || true
+
+# 12. Create 14-day rolling historical snapshot and prune expired records
+echo "[COOLIFY-SYNC] Archiving snapshot to history/${TIMESTAMP}..."
+rclone copy "${RCLONE_OPTS[@]}" "${STORAGE_TARGET}" "${STORAGE_TARGET}/history/${TIMESTAMP}" \
+  --include "coolify_bundle.tar.gz" \
+  --include "volumes_bundle.tar.gz" \
+  --include "coolify_pg_latest.sql.gz" \
+  --include "checksums.sha256" 2>/dev/null || true
+
+echo "[COOLIFY-SYNC] Pruning historical snapshots older than 14 days..."
+rclone delete "${RCLONE_OPTS[@]}" --min-age 14d "${STORAGE_TARGET}/history" 2>/dev/null || true
+rclone rmdirs "${RCLONE_OPTS[@]}" --leave-root "${STORAGE_TARGET}/history" 2>/dev/null || true
+
+echo "[COOLIFY-SYNC] Multi-threaded backup and Google Drive sync completed successfully!"
