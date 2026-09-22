@@ -235,6 +235,18 @@ if [ -d "/data/coolify/services/jlmfa7jdillwu9a9vfkh1hiz" ]; then
   echo "[COOLIFY-RESTORE] Duplicate service definition purged."
 fi
 
+# Purge obsolete Stirling PDF service so Bento PDF exclusively owns pdf.justsawyou.cyou
+if [ -d "/data/coolify/services/izmik1wbhrzpzwcub5uji2vv" ]; then
+  echo "[COOLIFY-RESTORE] Purging obsolete Stirling PDF service izmik1wbhrzpzwcub5uji2vv to give Bento PDF exclusive domain ownership..."
+  (cd /data/coolify/services/izmik1wbhrzpzwcub5uji2vv && sudo docker compose down -v 2>/dev/null || true)
+  sudo rm -rf "/data/coolify/services/izmik1wbhrzpzwcub5uji2vv"
+  sudo rm -rf /var/lib/docker/volumes/izmik1wbhrzpzwcub5uji2vv* 2>/dev/null || true
+  if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+    sudo docker exec coolify-db psql -U coolify -d coolify -c "DELETE FROM services WHERE uuid = 'izmik1wbhrzpzwcub5uji2vv';" 2>/dev/null || true
+  fi
+  echo "[COOLIFY-RESTORE] Stirling PDF purged successfully."
+fi
+
 # ==============================================================================
 # SAFEGUARD 4: Universal Auto-Discovery, Image Pull & Startup for User Services
 # Works dynamically for ANY current or future service/application deployed in Coolify
