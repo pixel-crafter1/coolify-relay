@@ -60,7 +60,8 @@ jobs:
           if [ -n "$RCLONE_CONFIG_BASE64" ]; then
             echo "$RCLONE_CONFIG_BASE64" | base64 -d > ~/.config/rclone/rclone.conf
             sudo cp -f ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
-            chmod 600 ~/.config/rclone/rclone.conf /root/.config/rclone/rclone.conf
+            chmod 600 ~/.config/rclone/rclone.conf
+            sudo chmod 600 /root/.config/rclone/rclone.conf
             echo "Rclone credentials restored for Google Drive."
           else
             echo "CRITICAL: RCLONE_CONFIG_BASE64 secret is missing!"
