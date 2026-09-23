@@ -48,11 +48,11 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             curl jq rclone pigz netcat-openbsd sqlite3 dnsutils ca-certificates openssh-server
 
-          # Install cloudflared
+          # Install cloudflared (direct official release deb)
           echo "Installing Cloudflare Tunnel client (cloudflared)..."
-          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
 
           # Restore Rclone configuration
           mkdir -p ~/.config/rclone
@@ -69,6 +69,7 @@ jobs:
 
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
           sudo mkdir -p /data/coolify /var/lib/docker/volumes /etc/cloudflared /tmp/prewarm_cache
+          sudo chmod 777 /tmp/prewarm_cache
 
           # Validate Google Drive Connectivity
           echo "Probing Google Drive connectivity at ${TARGET}..."
@@ -91,6 +92,7 @@ jobs:
             rclone copy "$TARGET" /tmp/prewarm_cache \
               --include "coolify_bundle.tar.gz" \
               --include "volumes_bundle.tar.gz" \
+              --include "coolify_pg_latest.sql.gz" \
               --drive-chunk-size 128M \
               --fast-list
 
@@ -102,7 +104,11 @@ jobs:
               echo "Decompressing application volumes with 4-core pigz..."
               pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
             fi
-            rm -rf /tmp/prewarm_cache
+            if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
+              sudo mkdir -p /data/coolify/backups
+              sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
+            fi
+            sudo rm -rf /tmp/prewarm_cache
           else
             # Cycle 0: Check if existing baseline exists on Google Drive
             if grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
@@ -110,12 +116,17 @@ jobs:
               rclone copy "$TARGET" /tmp/prewarm_cache \
                 --include "coolify_bundle.tar.gz" \
                 --include "volumes_bundle.tar.gz" \
+                --include "coolify_pg_latest.sql.gz" \
                 --drive-chunk-size 128M \
                 --fast-list
 
               [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
               [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
-              rm -rf /tmp/prewarm_cache
+              if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
+                sudo mkdir -p /data/coolify/backups
+                sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
+              fi
+              sudo rm -rf /tmp/prewarm_cache
             fi
           fi
 
@@ -258,7 +269,9 @@ jobs:
               sleep 6
             done
             if [ "$FLAG_FOUND" != "true" ]; then
-              echo "::warning::Sync complete flag timed out after 180s. Proceeding with latest verified state."
+              echo "::error::Predecessor sync_complete flag timed out after 180s! Predecessor may still be uploading or failed."
+              echo "Aborting state hydration to prevent downloading torn or corrupted state."
+              exit 1
             fi
           fi
 
@@ -266,34 +279,11 @@ jobs:
           chmod +x scripts/coolify/restore_delta.sh
           ./scripts/coolify/restore_delta.sh "$TARGET" "$CYCLE"
 
-          # Clear handshake flag
-          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
-
-          # Launch Cloudflare Tunnel connector with local wildcard ingress config
+          # Launch Cloudflare Tunnel connector
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-            echo "Configuring local Cloudflare Tunnel credentials and wildcard ingress..."
-            sudo mkdir -p /etc/cloudflared
-            python3 -c "
-import os, base64, json
-token = os.environ.get('CLOUDFLARE_TUNNEL_TOKEN', '').strip()
-if token:
-    raw = json.loads(base64.b64decode(token))
-    creds = {
-        'AccountTag': raw.get('a', ''),
-        'TunnelID': raw.get('t', ''),
-        'TunnelSecret': raw.get('s', '')
-    }
-    with open('/tmp/credentials.json', 'w') as f:
-        json.dump(creds, f)
-"
-            sudo mv -f /tmp/credentials.json /etc/cloudflared/credentials.json
-            sudo chmod 600 /etc/cloudflared/credentials.json
-            sudo cp -f configs/cloudflared/config.yml /etc/cloudflared/config.yml
-            sudo chmod 600 /etc/cloudflared/config.yml
-
-            echo "Starting Cloudflare Tunnel daemon..."
-            sudo cloudflared tunnel --config /etc/cloudflared/config.yml run > /tmp/cloudflared.log 2>&1 &
-            sleep 5
+            echo "Starting Cloudflare Tunnel daemon with token..."
+            sudo cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 6
 
             echo "Awaiting local Coolify dashboard (port 8000)..."
             COOLIFY_UP=false
@@ -306,7 +296,32 @@ if token:
               sleep 2
             done
             [ "$COOLIFY_UP" != "true" ] && sudo docker ps -a
+
+            echo "Verifying public Cloudflare tunnel endpoint..."
+            CF_ONLINE=false
+            for cf_chk in {1..30}; do
+              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://coolify.justsawyou.cyou || echo "000")
+              echo "Public URL check (${cf_chk}/30): HTTP ${CF_STATUS}"
+              if [ "$CF_STATUS" != "530" ] && [ "$CF_STATUS" != "000" ]; then
+                echo "SUCCESS: Cloudflare tunnel is publicly active (HTTP ${CF_STATUS})!"
+                CF_ONLINE=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "$CF_ONLINE" != "true" ]; then
+              echo "::error::Cloudflare tunnel failed to report healthy after 60s (HTTP ${CF_STATUS})."
+              cat /tmp/cloudflared.log || true
+              exit 1
+            fi
           fi
+
+          # Clear handshake flag ONLY AFTER services and dashboard are verified healthy
+          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          echo "Handshake flag cleared on Google Drive after health verification."
+
+          # Telegram Alert: Runner is online and serving
+          python3 scripts/coolify/notify_tg.py "🟢 <b>Coolify Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Status:</b> All containers active & verified.%0A• <b>Shift Length:</b> ~5.5 hours (330 mins)." 2>/dev/null || true
 
           # Cancel predecessor runner run to release GitHub concurrency
           REPOS=(
@@ -359,6 +374,20 @@ if token:
           while [ $ELAPSED -lt $HANDOVER_MINUTE ]; do
             sleep 60
             ELAPSED=$((ELAPSED + 1))
+            REMAINING=$((HANDOVER_MINUTE - ELAPSED))
+
+            # Telegram Countdown Alerts
+            if [ $HANDOVER_MINUTE -ge 300 ]; then
+              case $REMAINING in
+                240) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 4 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                180) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 3 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                120) python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 2 hours left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                60)  python3 scripts/coolify/notify_tg.py "⏳ <b>Shift Update:</b> 1 hour left until next runner handover (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                30)  python3 scripts/coolify/notify_tg.py "⚠️ <b>Shift Update:</b> 30 minutes left until successor rotation (%0A• Current node: ${GITHUB_REPOSITORY})" 2>/dev/null || true ;;
+                10)  python3 scripts/coolify/notify_tg.py "🚨 <b>Warning:</b> 10 minutes left until runner handover! Please avoid creating or modifying active deployments." 2>/dev/null || true ;;
+                2)   python3 scripts/coolify/notify_tg.py "⚠️ <b>Notice:</b> 2 minutes left. Preparing state snapshot and runner transfer." 2>/dev/null || true ;;
+              esac
+            fi
 
             # Maintain SSH key synchronization
             sudo docker exec coolify cat /var/www/html/storage/app/ssh/keys/id_ed25519.pub 2>/dev/null | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null || true
@@ -371,31 +400,36 @@ if token:
               fi
             fi
 
-            # Checkpoint backup every 30 minutes with 4-core pigz
+            # Checkpoint backup every 30 minutes with 4-core pigz (staged file-backed copyto, no un-rewindable rcat)
             if [ $((ELAPSED % 30)) -eq 0 ]; then
               echo "[$(date +'%T')] Minute ${ELAPSED}: Executing periodic SQL checkpoint to Google Drive..."
               if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 | \
-                  rclone rcat --drive-chunk-size=128M --drive-use-trash=false "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+                sudo mkdir -p /tmp/sql_checkpoints
+                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 > /tmp/sql_checkpoints/coolify_pg_latest.sql.gz
+                if [ -s /tmp/sql_checkpoints/coolify_pg_latest.sql.gz ]; then
+                  rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 --low-level-retries=10 --tpslimit=8 \
+                    /tmp/sql_checkpoints/coolify_pg_latest.sql.gz "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+                  echo "[$(date +'%T')] Periodic SQL checkpoint verified & uploaded ($(du -sh /tmp/sql_checkpoints/coolify_pg_latest.sql.gz | cut -f1))."
+                else
+                  echo "[$(date +'%T')] Warning: Checkpoint dump resulted in empty file. Skipping upload."
+                fi
+                sudo rm -rf /tmp/sql_checkpoints
               fi
             fi
           done
 
           echo "=== HANDOVER THRESHOLD REACHED (${HANDOVER_MINUTE}m) ==="
+          python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes or deployments right now. Syncing universal delta to Google Drive and dispatching successor..." 2>/dev/null || true
 
           # 1. Execute Atomic Delta Freeze & Upload to Google Drive
           echo "Executing Multi-Core Delta Freeze & Sync..."
           chmod +x scripts/coolify/sync_delta.sh
           ./scripts/coolify/sync_delta.sh "$TARGET"
 
-          # 2. Release Cloudflare Tunnel connector to prevent traffic collision
-          echo "Releasing Cloudflare Tunnel connector..."
-          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
-
-          # 3. Create synchronization flag on Google Drive
+          # 2. Create synchronization flag on Google Drive
           rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
-          # 4. Dispatch successor runner across the ring
+          # 3. Dispatch successor runner across the ring BEFORE releasing ingress
           REPOS=(
             "ember-ops1/coolify-relay"
             "silver-weaver/coolify-relay"
@@ -436,11 +470,26 @@ if token:
             return 1
           }
 
+          DISPATCH_SUCCESS=false
           echo "Dispatching successor runner to ${PRIMARY_TARGET}..."
-          if ! dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
+          if dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
+            DISPATCH_SUCCESS=true
+          else
             echo "Primary dispatch failed. Activating fallback: ${FALLBACK_TARGET}..."
-            dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT" || echo "CRITICAL: All dispatches failed!"
+            if dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT"; then
+              DISPATCH_SUCCESS=true
+            fi
           fi
+
+          if [ "$DISPATCH_SUCCESS" != "true" ]; then
+            echo "CRITICAL: All successor dispatches failed! Ingress will remain ACTIVE on this runner."
+            rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+            exit 1
+          fi
+
+          # 4. Successor dispatched successfully: release Cloudflare Tunnel connector
+          echo "Successor successfully dispatched. Releasing Cloudflare Tunnel connector to prevent traffic collision..."
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
 
           # 5. Await successor handshake claim
           echo "Awaiting successor to claim delta flag on Google Drive..."
