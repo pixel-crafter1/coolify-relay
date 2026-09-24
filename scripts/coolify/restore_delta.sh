@@ -71,10 +71,9 @@ rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 \
 sudo rm -rf "$STAGE_DIR"
 
 # ==============================================================================
-# SAFEGUARD 1: Strict Linux File Ownership & Permissions
+# SAFEGUARD 1: Targeted Linux Ownership & Permissions (S2 Hardened)
 # ==============================================================================
-echo "[COOLIFY-RESTORE] Applying baseline Linux filesystem permissions..."
-sudo chmod -R 755 /data/coolify 2>/dev/null || true
+echo "[COOLIFY-RESTORE] Applying targeted Linux filesystem permissions..."
 [ -d "/data/coolify/source" ] && sudo chmod -R 775 /data/coolify/source 2>/dev/null || true
 
 if [ -d "/data/coolify/ssh/keys" ]; then
@@ -83,8 +82,8 @@ if [ -d "/data/coolify/ssh/keys" ]; then
   sudo chmod 644 /data/coolify/ssh/keys/*.pub 2>/dev/null || true
 fi
 
-# Ensure all volume directories are accessible
-sudo chmod -R 755 /var/lib/docker/volumes 2>/dev/null || true
+# Ensure docker volume root exists without corrupting Postgres 0700/0750 permissions
+sudo chmod 755 /var/lib/docker /var/lib/docker/volumes 2>/dev/null || true
 
 # ==============================================================================
 # SAFEGUARD 2: Localhost SSH Injection & Daemon Hardening
@@ -359,6 +358,8 @@ for compose in "${ALL_COMPOSE[@]}"; do
 
   if [ "$is_db_active" = "true" ]; then
     compose_domain=$(grep -E 'traefik\.http\.routers\..*\.rule=Host\(' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*Host\(`([^`]+)`\).*/\1/' | tr -d ' ' || true)
+    # S4: Fallback to Caddy labels in Pass 1 as well to prevent ghost collisions on caddy-fronted services
+    [ -z "$compose_domain" ] && compose_domain=$(grep -E 'caddy_[0-9]+=https?://' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*https?:\/\/([^/[:space:]]+).*/\1/' | tr -d ' ' || true)
     ACTIVE_COMPOSE+=("$compose")
     if [ -n "$compose_domain" ]; then
       CLAIMED_DOMAINS+=("$compose_domain")
@@ -506,20 +507,36 @@ if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
     fi
   done
 
-  # 4. Boot all verified active service stacks
+  # 4. Boot all verified active service stacks (S3 Hardened: Persist logs and assert running status)
   for compose in "${ACTIVE_COMPOSE[@]}"; do
     workdir=$(dirname "$compose")
     svc_uuid=$(basename "$workdir")
     echo "[COOLIFY-RESTORE] Booting verified active service: $svc_uuid in $workdir..."
     env_arg=""
     [ -f "$workdir/.env" ] && env_arg="--env-file $workdir/.env"
-    (cd "$workdir" && sudo docker compose $env_arg --project-directory "$workdir" --project-name "$svc_uuid" -f "$compose" up -d --remove-orphans 2>&1 || true)
+
+    boot_log="/tmp/compose_up_${svc_uuid}.log"
+    if (cd "$workdir" && sudo docker compose $env_arg --project-directory "$workdir" --project-name "$svc_uuid" -f "$compose" up -d --remove-orphans > "$boot_log" 2>&1); then
+      running_cnt=$(sudo docker ps -q --filter "label=com.docker.compose.project=${svc_uuid}" --filter "status=running" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+      if [ "$running_cnt" -gt 0 ]; then
+        echo "[COOLIFY-RESTORE] Service $svc_uuid running successfully ($running_cnt containers active)."
+      else
+        echo "[COOLIFY-RESTORE] WARNING: Service $svc_uuid compose exited cleanly but no running containers detected! Log:"
+        tail -n 15 "$boot_log" 2>/dev/null || true
+      fi
+    else
+      echo "[COOLIFY-RESTORE] WARNING: Service $svc_uuid failed to start! Boot log output:"
+      cat "$boot_log" | tail -n 20 || true
+    fi
   done
 
-  # 4. Connect all started service containers to the shared 'coolify' network for universal proxy routing
-  for c in $(sudo docker ps -q --filter "label=coolify.managed=true"); do
-    sudo docker network connect coolify "$c" 2>/dev/null || true
-  done
+  # 4. Connect all started service containers to the shared 'coolify' network for universal proxy routing (S5 Hardened)
+  managed_containers=$(sudo docker ps -q --filter "label=coolify.managed=true" 2>/dev/null || true)
+  if [ -n "$managed_containers" ]; then
+    for c in $managed_containers; do
+      sudo docker network connect coolify "$c" 2>/dev/null || true
+    done
+  fi
 
   # 5. Synchronize Coolify UI Dashboard Status
   echo "[COOLIFY-RESTORE] Synchronizing Coolify UI dashboard status..."
