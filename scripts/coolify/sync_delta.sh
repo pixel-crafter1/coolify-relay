@@ -41,7 +41,7 @@ done
 if command -v sqlite3 >/dev/null 2>&1; then
   echo "[COOLIFY-SYNC] Checkpointing SQLite WAL files across volumes and configurations..."
   while IFS= read -r -d '' sqldb; do
-    if [ -f "$sqldb" ]; then
+    if sudo test -f "$sqldb"; then
       sudo sqlite3 "$sqldb" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
     fi
   done < <(sudo find /data/coolify /var/lib/docker/volumes -type f \( -name "*.sqlite" -o -name "*.db" \) -print0 2>/dev/null || true)
