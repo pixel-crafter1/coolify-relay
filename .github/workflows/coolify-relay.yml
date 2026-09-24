@@ -351,6 +351,26 @@ jobs:
           fi
 
       # =====================================================================
+      # F1 / C2 CIRCUIT BREAKER: PHASE 2 & 3 HYDRATION / INGRESS FAILURE HANDLER
+      # =====================================================================
+      - name: Phase 2/3 Hydration Failure Emergency Handler
+        if: failure() && steps.prewarm.outcome == 'success'
+        env:
+          STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          echo "=== EMERGENCY: Phase 2/3 Hydration or Ingress Failed on ${GITHUB_REPOSITORY} ==="
+          TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
+          CYCLE="${CYCLE_COUNT:-0}"
+
+          # 1. Clean up handshake flag so predecessor knows successor died and doesn't assume success
+          echo "Removing sync_complete.flag to alert predecessor..."
+          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+
+          # 2. Fire Critical Telegram Emergency Alert to page human operator
+          python3 scripts/coolify/notify_tg.py "🚨 <b>CRITICAL CLUSTER FAILURE:</b>%0A• <b>Failed Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Stage:</b> State Hydration / Cloudflare Ingress%0A• <b>Action Required:</b> Successor failed before takeover. Please inspect logs and trigger manual re-dispatch with cycle_count=${CYCLE}." 2>/dev/null || true
+
+      # =====================================================================
       # PHASE 4: 330m PRODUCTION SHIFT & WATCHDOG
       # =====================================================================
       - name: Production Shift & Successor Handover Dispatch
