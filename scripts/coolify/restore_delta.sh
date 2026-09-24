@@ -55,7 +55,14 @@ stage_and_extract "volumes_bundle.tar.gz" "/var/lib/docker/volumes"
 
 # Restart Docker daemon to index all extracted volumes
 echo "[COOLIFY-RESTORE] Reloading Docker daemon to recognize restored volumes..."
-sudo systemctl restart docker 2>/dev/null || true
+sudo systemctl restart docker 2>/dev/null || sudo service docker restart 2>/dev/null || true
+for chk in {1..15}; do
+  if sudo docker info >/dev/null 2>&1; then
+    echo "[COOLIFY-RESTORE] Docker daemon ready ($((chk*2))s)."
+    break
+  fi
+  sleep 2
+done
 
 # 3. Pull standalone PostgreSQL dump
 echo "[COOLIFY-RESTORE] Staging PostgreSQL dump..."
@@ -337,24 +344,52 @@ done < <(find /data/coolify/applications /data/coolify/services /data/coolify/da
 ACTIVE_COMPOSE=()
 CLAIMED_DOMAINS=()
 
+# PASS 1: Prioritize verified active resources from the database first
 for compose in "${ALL_COMPOSE[@]}"; do
   workdir=$(dirname "$compose")
   svc_uuid=$(basename "$workdir")
 
-  # 1. Check if UUID is explicitly active in the database
-  is_active=false
+  is_db_active=false
   for active_id in "${ACTIVE_UUIDS[@]}"; do
     if [ "$active_id" = "$svc_uuid" ]; then
-      is_active=true
+      is_db_active=true
       break
     fi
   done
 
-  # 2. Extract Traefik router Host domain from compose file
-  compose_domain=$(grep -E 'traefik\.http\.routers\..*\.rule=Host\(' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*Host\(`([^`]+)`\).*/\1/' | tr -d ' ' || true)
+  if [ "$is_db_active" = "true" ]; then
+    compose_domain=$(grep -E 'traefik\.http\.routers\..*\.rule=Host\(' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*Host\(`([^`]+)`\).*/\1/' | tr -d ' ' || true)
+    ACTIVE_COMPOSE+=("$compose")
+    if [ -n "$compose_domain" ]; then
+      CLAIMED_DOMAINS+=("$compose_domain")
+      echo "[COOLIFY-RESTORE] Database verified service: $svc_uuid claiming domain '$compose_domain'"
+    fi
+  fi
+done
 
-  # 3. Fallback discovery: If UUID not in DB, but compose defines a unique domain (e.g. Bento PDF) with no domain conflict
-  if [ "$is_active" != "true" ] && [ -n "$compose_domain" ]; then
+# PASS 2: Only discover uncatalogued services (e.g. Bento PDF) if their domain was NOT claimed in Pass 1
+# B1 Hardening: If coolify-db is running and ACTIVE_UUIDS is completely empty, fail closed to prevent ghost graveyard boot
+if [ ${#ACTIVE_UUIDS[@]} -eq 0 ] && sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
+  echo "[COOLIFY-RESTORE] CRITICAL: coolify-db is active but ACTIVE_UUIDS is empty! Skipping Pass 2 uncatalogued discovery to prevent ghost collision."
+else
+for compose in "${ALL_COMPOSE[@]}"; do
+  workdir=$(dirname "$compose")
+  svc_uuid=$(basename "$workdir")
+
+  # Check if already added in Pass 1
+  already_added=false
+  for existing in "${ACTIVE_COMPOSE[@]}"; do
+    if [ "$existing" = "$compose" ]; then
+      already_added=true
+      break
+    fi
+  done
+  [ "$already_added" = "true" ] && continue
+
+  compose_domain=$(grep -E 'traefik\.http\.routers\..*\.rule=Host\(' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*Host\(`([^`]+)`\).*/\1/' | tr -d ' ' || true)
+  [ -z "$compose_domain" ] && compose_domain=$(grep -E 'caddy_[0-9]+=https?://' "$compose" 2>/dev/null | head -n 1 | sed -E 's/.*https?:\/\/([^/[:space:]]+).*/\1/' | tr -d ' ' || true)
+
+  if [ -n "$compose_domain" ]; then
     domain_already_claimed=false
     for claimed in "${CLAIMED_DOMAINS[@]}"; do
       if [ "$claimed" = "$compose_domain" ]; then
@@ -362,19 +397,19 @@ for compose in "${ALL_COMPOSE[@]}"; do
         break
       fi
     done
+
     if [ "$domain_already_claimed" != "true" ]; then
       echo "[COOLIFY-RESTORE] Unique active service stack discovered: $svc_uuid claiming domain $compose_domain. Promoting to active."
-      is_active=true
+      ACTIVE_COMPOSE+=("$compose")
+      CLAIMED_DOMAINS+=("$compose_domain")
+    else
+      echo "[COOLIFY-RESTORE] Skipping duplicate/zombie service: $svc_uuid (domain '$compose_domain' already claimed by database service)"
     fi
-  fi
-
-  if [ "$is_active" = "true" ]; then
-    ACTIVE_COMPOSE+=("$compose")
-    [ -n "$compose_domain" ] && CLAIMED_DOMAINS+=("$compose_domain")
   else
-    echo "[COOLIFY-RESTORE] Skipping duplicate/zombie service: $svc_uuid (domain: ${compose_domain:-none})"
+    echo "[COOLIFY-RESTORE] Skipping unknown zombie compose: $svc_uuid (no domain)"
   fi
 done
+fi
 
 if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
   echo "[COOLIFY-RESTORE] Found ${#ACTIVE_COMPOSE[@]} verified active service stack(s)."
@@ -401,37 +436,73 @@ if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
 
   # 3. Reconcile persistent user volume data across service UUID rotations
   echo "[COOLIFY-RESTORE] Reconciling persistent volume data across redeployed stacks..."
-  # Code Server workspace & Claude chat history
-  for active_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*code-server*" -type d 2>/dev/null); do
-    if [ -d "$active_vol/_data" ]; then
-      cur_files=$(sudo find "$active_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
-      if [ "$cur_files" -le 2 ]; then
-        older_vol=$(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*code-server*" -type d ! -path "$active_vol" 2>/dev/null | while read v; do
-          cnt=$(sudo find "$v/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
-          [ "$cnt" -gt 2 ] && echo "$v"
-        done | head -n 1)
-        if [ -n "$older_vol" ] && [ -d "$older_vol/_data" ]; then
-          echo "[COOLIFY-RESTORE] Restoring Code Server workspace and Claude chat logs from $older_vol into $active_vol..."
-          sudo cp -a "$older_vol/_data/." "$active_vol/_data/" 2>/dev/null || true
-        fi
+
+  # B2 Hardening: Dynamically discover the active Code Server volume from ACTIVE_COMPOSE
+  ACTIVE_CS_VOL=""
+  for act_cmp in "${ACTIVE_COMPOSE[@]}"; do
+    if grep -q "code-server" "$act_cmp" 2>/dev/null; then
+      # Extract volume mapping line e.g. <uuid>_code-server-config:/config
+      parsed_vol=$(grep -E '[a-z0-9]+_code-server-config:' "$act_cmp" 2>/dev/null | head -n 1 | sed -E 's/.*- ['"'"'"]?([a-z0-9_]+_code-server-config).*/\1/' | tr -d ' ' || true)
+      if [ -n "$parsed_vol" ]; then
+        ACTIVE_CS_VOL="$parsed_vol"
+        break
       fi
     fi
   done
 
-  # Hermes agent chat history & database
-  for active_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*hermes*" -type d 2>/dev/null); do
-    if [ -d "$active_vol/_data" ]; then
-      cur_files=$(sudo find "$active_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
-      if [ "$cur_files" -le 2 ]; then
-        older_vol=$(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*hermes*" -type d ! -path "$active_vol" 2>/dev/null | while read v; do
-          cnt=$(sudo find "$v/_data" -maxdepth 2 -type f 2>/dev/null | wc -l || echo 0)
-          [ "$cnt" -gt 2 ] && echo "$v"
-        done | head -n 1)
-        if [ -n "$older_vol" ] && [ -d "$older_vol/_data" ]; then
-          echo "[COOLIFY-RESTORE] Restoring Hermes agent profiles and history from $older_vol into $active_vol..."
-          sudo cp -a "$older_vol/_data/." "$active_vol/_data/" 2>/dev/null || true
+  # Fallback: find newest by modification time if not parsed from compose
+  if [ -z "$ACTIVE_CS_VOL" ] || [ ! -d "/var/lib/docker/volumes/$ACTIVE_CS_VOL" ]; then
+    ACTIVE_CS_VOL=$(sudo ls -td /var/lib/docker/volumes/*code-server* 2>/dev/null | head -n 1 | xargs -r basename || true)
+  fi
+
+  if [ -n "$ACTIVE_CS_VOL" ] && [ -d "/var/lib/docker/volumes/$ACTIVE_CS_VOL/_data" ]; then
+    echo "[COOLIFY-RESTORE] Active Code Server volume identified dynamically: $ACTIVE_CS_VOL"
+    for older_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*code-server*" -type d ! -name "$ACTIVE_CS_VOL" 2>/dev/null); do
+      if [ -d "$older_vol/_data" ]; then
+        older_cnt=$(sudo find "$older_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+        active_cnt=$(sudo find "/var/lib/docker/volumes/$ACTIVE_CS_VOL/_data" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+        # R1 Hardening: Use non-clobber (-n) copy so newer active edits are never overwritten by older files
+        if [ "$older_cnt" -gt "$active_cnt" ] || [ "$active_cnt" -le 2 ]; then
+          echo "[COOLIFY-RESTORE] Restoring richer Code Server workspace & Claude chats from $older_vol into $ACTIVE_CS_VOL (no-clobber)..."
+          sudo cp -an "$older_vol/_data/." "/var/lib/docker/volumes/$ACTIVE_CS_VOL/_data/" 2>/dev/null || true
         fi
       fi
+    done
+  fi
+
+  # F1 Hardening: Hermes reconciliation scoped strictly by volume role suffix
+  # Prevents role contamination across distinct mounts: hermes-home, hermes-agent-src, hermes-workspace
+  HERMES_ROLES=("hermes-home" "hermes-agent-src" "hermes-workspace")
+  for role in "${HERMES_ROLES[@]}"; do
+    ACTIVE_ROLE_VOL=""
+    # 1. First attempt to derive active role volume from ACTIVE_COMPOSE
+    for act_cmp in "${ACTIVE_COMPOSE[@]}"; do
+      if grep -q "hermes" "$act_cmp" 2>/dev/null; then
+        parsed_role_vol=$(grep -E "[a-z0-9]+_${role}:" "$act_cmp" 2>/dev/null | head -n 1 | sed -E "s/.*- ['\"']?([a-z0-9_]+_${role}).*/\1/" | tr -d ' ' || true)
+        if [ -n "$parsed_role_vol" ]; then
+          ACTIVE_ROLE_VOL="$parsed_role_vol"
+          break
+        fi
+      fi
+    done
+
+    # 2. Fallback to newest volume matching this specific role suffix
+    if [ -z "$ACTIVE_ROLE_VOL" ] || [ ! -d "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL" ]; then
+      ACTIVE_ROLE_VOL=$(sudo ls -td /var/lib/docker/volumes/*"${role}"* 2>/dev/null | head -n 1 | xargs -r basename || true)
+    fi
+
+    # 3. Non-clobber reconcile only from older volumes sharing the exact same role
+    if [ -n "$ACTIVE_ROLE_VOL" ] && [ -d "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data" ]; then
+      for older_role_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*${role}*" -type d ! -name "$ACTIVE_ROLE_VOL" 2>/dev/null); do
+        if [ -d "$older_role_vol/_data" ]; then
+          older_cnt=$(sudo find "$older_role_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+          active_cnt=$(sudo find "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+          if [ "$older_cnt" -gt "$active_cnt" ] || [ "$active_cnt" -le 2 ]; then
+            echo "[COOLIFY-RESTORE] Restoring older $role state from $older_role_vol into $ACTIVE_ROLE_VOL (no-clobber)..."
+            sudo cp -an "$older_role_vol/_data/." "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data/" 2>/dev/null || true
+          fi
+        fi
+      done
     fi
   done
 
