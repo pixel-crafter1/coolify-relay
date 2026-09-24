@@ -406,6 +406,7 @@ jobs:
               echo "[$(date +'%T')] Minute ${ELAPSED}: Executing periodic SQL checkpoint to Google Drive..."
               if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
                 sudo mkdir -p /tmp/sql_checkpoints
+                sudo chmod 777 /tmp/sql_checkpoints
                 sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 > /tmp/sql_checkpoints/coolify_pg_latest.sql.gz
                 if [ -s /tmp/sql_checkpoints/coolify_pg_latest.sql.gz ]; then
                   rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 --low-level-retries=10 --tpslimit=8 \
