@@ -73,14 +73,18 @@ archive_and_upload() {
 
   echo "[COOLIFY-SYNC] Archiving $source_path to local staging ($local_tar_file)..."
   set +e
+  local tar_rc=0
+  local pigz_rc=0
   if command -v pigz >/dev/null 2>&1; then
     sudo tar -cpf - -C "$source_path" --warning=no-file-changed "${exclude_args[@]}" . | pigz -p 4 -6 > "$local_tar_file"
-    local tar_rc="${PIPESTATUS[0]}"
-    local pigz_rc="${PIPESTATUS[1]}"
+    local ps=("${PIPESTATUS[@]}")
+    tar_rc="${ps[0]:-0}"
+    pigz_rc="${ps[1]:-0}"
   else
     sudo tar -cpzf "$local_tar_file" -C "$source_path" --warning=no-file-changed "${exclude_args[@]}" .
-    local tar_rc="${PIPESTATUS[0]}"
-    local pigz_rc=0
+    local ps=("${PIPESTATUS[@]}")
+    tar_rc="${ps[0]:-0}"
+    pigz_rc=0
   fi
   set -e
 
