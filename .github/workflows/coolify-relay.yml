@@ -443,10 +443,13 @@ jobs:
           echo "=== HANDOVER THRESHOLD REACHED (${HANDOVER_MINUTE}m) ==="
           python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes or deployments right now. Syncing universal delta to Google Drive and dispatching successor..." 2>/dev/null || true
 
-          # 1. Execute Atomic Delta Freeze & Upload to Google Drive
+          # 1. Execute Atomic Delta Freeze & Upload to Google Drive (with failure recovery)
           echo "Executing Multi-Core Delta Freeze & Sync..."
           chmod +x scripts/coolify/sync_delta.sh
-          ./scripts/coolify/sync_delta.sh "$TARGET"
+          if ! ./scripts/coolify/sync_delta.sh "$TARGET"; then
+            echo "::error::sync_delta.sh failed during handover! Dispatching emergency alert..."
+            python3 scripts/coolify/notify_tg.py "🚨 <b>HANDOVER BACKUP FAILED:</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• State sync failed before flag creation. Node will still attempt to dispatch successor (${PRIMARY_TARGET}) using latest verified snapshot." 2>/dev/null || true
+          fi
 
           # 2. Create synchronization flag on Google Drive
           rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
