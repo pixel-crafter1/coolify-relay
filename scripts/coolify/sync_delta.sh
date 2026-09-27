@@ -116,14 +116,18 @@ archive_and_upload() {
     return 1
   fi
 
-  # B3: Verify archive manifest integrity using tar -tz
+  # B3: Verify archive manifest integrity using tar -tz (P0-1 Hardened: disable pipefail for probe to prevent SIGPIPE exit 141)
   echo "[COOLIFY-SYNC] Verifying archive manifest integrity..."
-  local manifest_count
+  local manifest_count=0
+  set +o pipefail
   if command -v pigz >/dev/null 2>&1; then
-    manifest_count=$(pigz -dc "$local_tar_file" | tar -tf - 2>/dev/null | head -n 100 | wc -l | tr -d ' ' || echo 0)
+    manifest_count=$(pigz -dc "$local_tar_file" 2>/dev/null | tar -tf - 2>/dev/null | head -n 10 | wc -l || echo 0)
   else
-    manifest_count=$(tar -tzf "$local_tar_file" 2>/dev/null | head -n 100 | wc -l | tr -d ' ' || echo 0)
+    manifest_count=$(tar -tzf "$local_tar_file" 2>/dev/null | head -n 10 | wc -l || echo 0)
   fi
+  set -o pipefail
+  manifest_count=$(echo "$manifest_count" | tr -dc '0-9')
+  manifest_count="${manifest_count:-0}"
 
   if [ "$manifest_count" -lt 1 ]; then
     echo "[COOLIFY-SYNC] CRITICAL: Archive $local_tar_file contains 0 valid entries! Aborting upload."
