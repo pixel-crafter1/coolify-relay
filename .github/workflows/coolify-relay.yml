@@ -14,7 +14,7 @@ on:
         default: '0'
         type: string
       test_handover:
-        description: 'Test mode: hand over after X minutes (0 for normal 330m)'
+        description: 'Test mode: hand over after X minutes (0 for normal 320m)'
         required: false
         default: '0'
         type: string
@@ -322,7 +322,7 @@ jobs:
           echo "Handshake flag cleared on Google Drive after health verification."
 
           # Telegram Alert: Runner is online and serving
-          python3 scripts/coolify/notify_tg.py "🟢 <b>Coolify Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Status:</b> All containers active & verified.%0A• <b>Shift Length:</b> ~5.5 hours (330 mins)." 2>/dev/null || true
+          python3 scripts/coolify/notify_tg.py "🟢 <b>Coolify Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Status:</b> All containers active & verified.%0A• <b>Shift Length:</b> ~5.3 hours (320 mins)." 2>/dev/null || true
 
           # Cancel predecessor runner run to release GitHub concurrency
           REPOS=(
@@ -371,7 +371,7 @@ jobs:
           python3 scripts/coolify/notify_tg.py "🚨 <b>CRITICAL CLUSTER FAILURE:</b>%0A• <b>Failed Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Stage:</b> State Hydration / Cloudflare Ingress%0A• <b>Action Required:</b> Successor failed before takeover. Please inspect logs and trigger manual re-dispatch with cycle_count=${CYCLE}." 2>/dev/null || true
 
       # =====================================================================
-      # PHASE 4: 330m PRODUCTION SHIFT & WATCHDOG
+      # PHASE 4: 320m PRODUCTION SHIFT & WATCHDOG
       # =====================================================================
       - name: Production Shift & Successor Handover Dispatch
         env:
@@ -383,7 +383,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== PHASE 4: Production Shift Active ==="
-          HANDOVER_MINUTE=330
+          HANDOVER_MINUTE=320
           if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
             HANDOVER_MINUTE=$TEST_HANDOVER
           fi
@@ -443,15 +443,17 @@ jobs:
           echo "=== HANDOVER THRESHOLD REACHED (${HANDOVER_MINUTE}m) ==="
           python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes or deployments right now. Syncing universal delta to Google Drive and dispatching successor..." 2>/dev/null || true
 
-          # 1. Execute Atomic Delta Freeze & Upload to Google Drive (with failure recovery)
+          # 1. Execute Atomic Delta Freeze & Upload to Google Drive (P0-2 Hardened: fail-closed)
           echo "Executing Multi-Core Delta Freeze & Sync..."
           chmod +x scripts/coolify/sync_delta.sh
           if ! ./scripts/coolify/sync_delta.sh "$TARGET"; then
-            echo "::error::sync_delta.sh failed during handover! Dispatching emergency alert..."
-            python3 scripts/coolify/notify_tg.py "🚨 <b>HANDOVER BACKUP FAILED:</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• State sync failed before flag creation. Node will still attempt to dispatch successor (${PRIMARY_TARGET}) using latest verified snapshot." 2>/dev/null || true
+            echo "::error::sync_delta.sh failed during handover! Aborting handover to protect state baseline."
+            python3 scripts/coolify/notify_tg.py "🚨 <b>HANDOVER BACKUP FAILED:</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• State sync failed. Ingress kept active to prevent torn state." 2>/dev/null || true
+            rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+            exit 1
           fi
 
-          # 2. Create synchronization flag on Google Drive
+          # 2. Create synchronization flag on Google Drive only after verified backup success
           rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
 
           # 3. Dispatch successor runner across the ring BEFORE releasing ingress
