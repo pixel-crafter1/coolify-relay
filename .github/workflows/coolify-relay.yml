@@ -94,7 +94,7 @@ jobs:
               --include "coolify_bundle.tar.gz" \
               --include "volumes_bundle.tar.gz" \
               --include "coolify_pg_latest.sql.gz" \
-              --drive-chunk-size 128M \
+              --drive-chunk-size 512M \
               --fast-list
 
             if [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ]; then
@@ -118,7 +118,7 @@ jobs:
                 --include "coolify_bundle.tar.gz" \
                 --include "volumes_bundle.tar.gz" \
                 --include "coolify_pg_latest.sql.gz" \
-                --drive-chunk-size 128M \
+                --drive-chunk-size 512M \
                 --fast-list
 
               [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
@@ -204,9 +204,10 @@ jobs:
 
           REPOS=(
             "ember-ops1/coolify-relay"
-            "silver-weaver/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
+            "silver-demon60/coolify-relay"
+            "12stack-phantom/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -261,7 +262,7 @@ jobs:
           if [ "$CYCLE" != "0" ]; then
             echo "Awaiting predecessor delta synchronization flag on Google Drive..."
             FLAG_FOUND=false
-            for sec in {1..30}; do
+            for sec in {1..100}; do
               if rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
                 echo "Predecessor sync_complete flag detected ($((sec * 6))s)."
                 FLAG_FOUND=true
@@ -270,7 +271,7 @@ jobs:
               sleep 6
             done
             if [ "$FLAG_FOUND" != "true" ]; then
-              echo "::error::Predecessor sync_complete flag timed out after 180s! Predecessor may still be uploading or failed."
+              echo "::error::Predecessor sync_complete flag timed out after 600s! Predecessor may still be uploading or failed."
               echo "Aborting state hydration to prevent downloading torn or corrupted state."
               exit 1
             fi
@@ -322,14 +323,15 @@ jobs:
           echo "Handshake flag cleared on Google Drive after health verification."
 
           # Telegram Alert: Runner is online and serving
-          python3 scripts/coolify/notify_tg.py "🟢 <b>Coolify Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Status:</b> All containers active & verified.%0A• <b>Shift Length:</b> ~5.3 hours (320 mins)." 2>/dev/null || true
+          python3 scripts/coolify/notify_tg.py "🟢 <b>Coolify Node Online!</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Status:</b> All containers active & verified.%0A• <b>Shift Length:</b> ~5.0 hours (300 mins)." 2>/dev/null || true
 
           # Cancel predecessor runner run to release GitHub concurrency
           REPOS=(
             "ember-ops1/coolify-relay"
-            "silver-weaver/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
+            "silver-demon60/coolify-relay"
+            "12stack-phantom/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -383,7 +385,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== PHASE 4: Production Shift Active ==="
-          HANDOVER_MINUTE=320
+          HANDOVER_MINUTE=300
           if [ -n "$TEST_HANDOVER" ] && [ "$TEST_HANDOVER" -gt 0 ] 2>/dev/null; then
             HANDOVER_MINUTE=$TEST_HANDOVER
           fi
@@ -427,9 +429,9 @@ jobs:
               if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
                 sudo mkdir -p /tmp/sql_checkpoints
                 sudo chmod 777 /tmp/sql_checkpoints
-                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 > /tmp/sql_checkpoints/coolify_pg_latest.sql.gz
+                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -1 > /tmp/sql_checkpoints/coolify_pg_latest.sql.gz
                 if [ -s /tmp/sql_checkpoints/coolify_pg_latest.sql.gz ]; then
-                  rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 --low-level-retries=10 --tpslimit=8 \
+                  rclone copyto --drive-chunk-size=512M --drive-upload-cutoff=32M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 --low-level-retries=10 \
                     /tmp/sql_checkpoints/coolify_pg_latest.sql.gz "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
                   echo "[$(date +'%T')] Periodic SQL checkpoint verified & uploaded ($(du -sh /tmp/sql_checkpoints/coolify_pg_latest.sql.gz | cut -f1))."
                 else
@@ -459,9 +461,10 @@ jobs:
           # 3. Dispatch successor runner across the ring BEFORE releasing ingress
           REPOS=(
             "ember-ops1/coolify-relay"
-            "silver-weaver/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
+            "silver-demon60/coolify-relay"
+            "12stack-phantom/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
