@@ -50,7 +50,7 @@ fi
 # 3. Dump Coolify PostgreSQL database atomically while coolify-db is running
 if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
   echo "[COOLIFY-SYNC] Dumping Coolify PostgreSQL database (coolify-db)..."
-  sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -6 > "${BACKUP_DIR}/coolify_pg_latest.sql.gz" || \
+  sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -1 > "${BACKUP_DIR}/coolify_pg_latest.sql.gz" || \
     (sudo docker exec coolify-db pg_dumpall -U coolify --clean | gzip > "${BACKUP_DIR}/coolify_pg_latest.sql.gz")
   echo "[COOLIFY-SYNC] DB dump complete: $(du -sh "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | cut -f1)"
 fi
@@ -76,7 +76,7 @@ archive_and_upload() {
   local tar_rc=0
   local pigz_rc=0
   if command -v pigz >/dev/null 2>&1; then
-    sudo tar -cpf - -C "$source_path" --warning=no-file-changed "${exclude_args[@]}" . | pigz -p 4 -6 > "$local_tar_file"
+    sudo tar -cpf - -C "$source_path" --warning=no-file-changed "${exclude_args[@]}" . | pigz -p 4 -1 > "$local_tar_file"
     local ps=("${PIPESTATUS[@]}")
     tar_rc="${ps[0]:-0}"
     pigz_rc="${ps[1]:-0}"
@@ -137,11 +137,15 @@ archive_and_upload() {
 
   echo "[COOLIFY-SYNC] Archive verified: $(du -sh "$local_tar_file" | cut -f1) (${manifest_count}+ files verified). Uploading to $remote_dest..."
   rclone copyto "$local_tar_file" "$remote_dest" \
-    --drive-chunk-size=128M \
+    --drive-chunk-size=512M \
+    --drive-upload-cutoff=32M \
+    --drive-pacer-min-sleep=10ms \
+    --buffer-size=64M \
+    --use-mmap \
     --drive-use-trash=false \
     --retries=5 \
     --low-level-retries=10 \
-    --tpslimit=8
+    --timeout=3m
 
   sudo rm -f "$local_tar_file"
   return 0
@@ -162,11 +166,15 @@ archive_and_upload "/data/coolify" \
 if [ -s "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
   echo "[COOLIFY-SYNC] Uploading standalone DB dump to Google Drive ($(du -sh "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | cut -f1))..."
   rclone copyto "${BACKUP_DIR}/coolify_pg_latest.sql.gz" "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" \
-    --drive-chunk-size=128M \
+    --drive-chunk-size=512M \
+    --drive-upload-cutoff=32M \
+    --drive-pacer-min-sleep=10ms \
+    --buffer-size=64M \
+    --use-mmap \
     --drive-use-trash=false \
     --retries=5 \
     --low-level-retries=10 \
-    --tpslimit=8
+    --timeout=3m
 else
   echo "[COOLIFY-SYNC] CRITICAL: PostgreSQL dump file is missing or 0 bytes! Aborting upload to preserve remote baseline."
   exit 1
