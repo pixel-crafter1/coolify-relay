@@ -28,7 +28,7 @@ stage_and_extract() {
   echo "[COOLIFY-RESTORE] Checking for ${remote_file} in ${STORAGE_TARGET}..."
   if rclone lsf --drive-use-trash=false "${STORAGE_TARGET}" 2>/dev/null | grep -qx "${remote_file}"; then
     echo "[COOLIFY-RESTORE] Staging ${remote_file} to local NVMe storage..."
-    rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 --low-level-retries=10 \
+    rclone copyto --drive-chunk-size=512M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 --low-level-retries=10 \
       "${STORAGE_TARGET}/${remote_file}" "$local_stage"
 
     if [ ! -s "$local_stage" ]; then
@@ -66,7 +66,7 @@ done
 
 # 3. Pull standalone PostgreSQL dump
 echo "[COOLIFY-RESTORE] Staging PostgreSQL dump..."
-rclone copyto --drive-chunk-size=128M --drive-use-trash=false --retries=5 \
+rclone copyto --drive-chunk-size=512M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 \
   "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null || true
 sudo rm -rf "$STAGE_DIR"
 
