@@ -69,8 +69,7 @@ jobs:
           fi
 
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
-          sudo mkdir -p /data/coolify /var/lib/docker/volumes /etc/cloudflared /tmp/prewarm_cache
-          sudo chmod 777 /tmp/prewarm_cache
+          sudo mkdir -p /data/coolify /var/lib/docker/volumes /etc/cloudflared
 
           # Validate Google Drive Connectivity
           echo "Probing Google Drive connectivity at ${TARGET}..."
@@ -82,52 +81,17 @@ jobs:
 
           # Fail-Closed Guard: For any cycle > 0, state recovery is mandatory
           if [ "$CYCLE" != "0" ]; then
-            echo "Cycle ${CYCLE} detected. Enforcing mandatory state retrieval..."
+            echo "Cycle ${CYCLE} detected. Verifying remote state baseline existence on Google Drive..."
             if ! grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
               echo "CRITICAL: Cycle is ${CYCLE} but 'coolify_bundle.tar.gz' is missing from Google Drive!"
               echo "Halting pre-warm to prevent blank state overwrite."
               exit 1
             fi
-
-            echo "Fetching baseline bundles from Google Drive..."
-            rclone copy "$TARGET" /tmp/prewarm_cache \
-              --include "coolify_bundle.tar.gz" \
-              --include "volumes_bundle.tar.gz" \
-              --include "coolify_pg_latest.sql.gz" \
-              --drive-chunk-size 512M \
-              --fast-list
-
-            if [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ]; then
-              echo "Decompressing core state with 4-core pigz..."
-              pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
-            fi
-            if [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ]; then
-              echo "Decompressing application volumes with 4-core pigz..."
-              pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
-            fi
-            if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
-              sudo mkdir -p /data/coolify/backups
-              sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
-            fi
-            sudo rm -rf /tmp/prewarm_cache
+            echo "Google Drive state baseline confirmed present for Cycle ${CYCLE}."
           else
             # Cycle 0: Check if existing baseline exists on Google Drive
             if grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
-              echo "Cycle 0 with existing Google Drive baseline detected. Hydrating..."
-              rclone copy "$TARGET" /tmp/prewarm_cache \
-                --include "coolify_bundle.tar.gz" \
-                --include "volumes_bundle.tar.gz" \
-                --include "coolify_pg_latest.sql.gz" \
-                --drive-chunk-size 512M \
-                --fast-list
-
-              [ -f "/tmp/prewarm_cache/coolify_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/coolify_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /data/coolify || true
-              [ -f "/tmp/prewarm_cache/volumes_bundle.tar.gz" ] && pigz -dc -p 4 /tmp/prewarm_cache/volumes_bundle.tar.gz | sudo tar --numeric-owner -xpf - -C /var/lib/docker/volumes || true
-              if [ -f "/tmp/prewarm_cache/coolify_pg_latest.sql.gz" ]; then
-                sudo mkdir -p /data/coolify/backups
-                sudo cp -f /tmp/prewarm_cache/coolify_pg_latest.sql.gz /data/coolify/backups/coolify_pg_latest.sql.gz
-              fi
-              sudo rm -rf /tmp/prewarm_cache
+              echo "Cycle 0 with existing Google Drive baseline detected. Verified restore will run in Phase 2."
             fi
           fi
 
@@ -139,15 +103,6 @@ jobs:
           sudo docker pull traefik:v3.1 || sudo docker pull traefik:v3.0 || true
           sudo docker pull postgres:15-alpine || sudo docker pull postgres:16-alpine || true
           sudo docker pull redis:7-alpine || sudo docker pull redis:alpine || true
-
-          # Universal Pre-Pull: Dynamically scan restored compose files for user-deployed images
-          if [ -d "/data/coolify/applications" ] || [ -d "/data/coolify/services" ]; then
-            echo "Pre-pulling application images found in restored configurations..."
-            for cmp in $(find /data/coolify/applications /data/coolify/services -name "docker-compose.yml" 2>/dev/null || true); do
-              (cd "$(dirname "$cmp")" && sudo docker compose pull -q 2>/dev/null || true) &
-            done
-            wait
-          fi
 
           # Strict Fail-Closed Check: Never bootstrap blank install if cycle > 0
           if [ ! -f "/data/coolify/source/docker-compose.yml" ]; then
@@ -423,21 +378,36 @@ jobs:
               fi
             fi
 
-            # Checkpoint backup every 30 minutes with 4-core pigz (staged file-backed copyto, no un-rewindable rcat)
+            # Checkpoint backup every 30 minutes with 4-core pigz (Audit Hardened: PIPESTATUS + gzip -t + sentinel + C10 / R5-7 fix)
             if [ $((ELAPSED % 30)) -eq 0 ]; then
-              echo "[$(date +'%T')] Minute ${ELAPSED}: Executing periodic SQL checkpoint to Google Drive..."
-              if sudo docker ps --format '{{.Names}}' | grep -q 'coolify-db'; then
-                sudo mkdir -p /tmp/sql_checkpoints
-                sudo chmod 777 /tmp/sql_checkpoints
-                sudo docker exec coolify-db pg_dumpall -U coolify --clean 2>/dev/null | pigz -p 4 -1 > /tmp/sql_checkpoints/coolify_pg_latest.sql.gz
-                if [ -s /tmp/sql_checkpoints/coolify_pg_latest.sql.gz ]; then
-                  rclone copyto --drive-chunk-size=512M --drive-upload-cutoff=32M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 --low-level-retries=10 \
-                    /tmp/sql_checkpoints/coolify_pg_latest.sql.gz "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
-                  echo "[$(date +'%T')] Periodic SQL checkpoint verified & uploaded ($(du -sh /tmp/sql_checkpoints/coolify_pg_latest.sql.gz | cut -f1))."
+              echo "[$(date +'%T')] Minute ${ELAPSED}: Executing verified periodic SQL checkpoint to Google Drive..."
+              CHECK_DB=$(sudo docker ps --format '{{.Names}}' 2>/dev/null || true)
+              if printf '%s\n' "$CHECK_DB" | grep -qx 'coolify-db'; then
+                sudo rm -rf /tmp/sql_checkpoints 2>/dev/null || true
+                mkdir -p /tmp/sql_checkpoints && chmod 700 /tmp/sql_checkpoints
+                chk_dump="/tmp/sql_checkpoints/coolify_pg_latest.sql.gz"
+                chk_partial="${chk_dump}.partial"
+                rm -f "$chk_partial"
+                set +e
+                sudo docker exec coolify-db pg_dumpall -U coolify --clean --if-exists 2>/tmp/sql_checkpoints/chk.err | pigz -p 4 -1 > "$chk_partial"
+                chk_ps=("${PIPESTATUS[@]}")
+                set -e
+                chk_pg_rc="${chk_ps[0]:-0}"
+                chk_pigz_rc="${chk_ps[1]:-0}"
+
+                if [ "$chk_pg_rc" -eq 0 ] && [ "$chk_pigz_rc" -eq 0 ] && [ -s "$chk_partial" ]; then
+                  if gzip -t "$chk_partial" 2>/dev/null && (pigz -dc "$chk_partial" 2>/dev/null || gzip -dc "$chk_partial" 2>/dev/null) | tail -c 1024 | grep -q 'PostgreSQL database dump complete'; then
+                    mv -f "$chk_partial" "$chk_dump"
+                    rclone copyto --drive-chunk-size=512M --drive-upload-cutoff=32M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 --low-level-retries=10 \
+                      "$chk_dump" "${TARGET}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+                    echo "[$(date +'%T')] Periodic SQL checkpoint verified & uploaded ($(du -sh "$chk_dump" | cut -f1))."
+                  else
+                    echo "[$(date +'%T')] Warning: Checkpoint dump failed integrity or sentinel test. Skipping upload to protect baseline."
+                  fi
                 else
-                  echo "[$(date +'%T')] Warning: Checkpoint dump resulted in empty file. Skipping upload."
+                  echo "[$(date +'%T')] Warning: Checkpoint dump pipeline failed (pg_rc=$chk_pg_rc, pigz_rc=$chk_pigz_rc). Skipping upload."
                 fi
-                sudo rm -rf /tmp/sql_checkpoints
+                rm -rf /tmp/sql_checkpoints
               fi
             fi
           done
