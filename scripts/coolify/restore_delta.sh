@@ -16,8 +16,13 @@ STAGE_DIR="/tmp/coolify_restore_stage"
 echo "[COOLIFY-RESTORE] === Universal State Hydration & Environment Provisioning ==="
 echo "[COOLIFY-RESTORE] Storage Target: ${STORAGE_TARGET} (Cycle: ${CYCLE_COUNT})"
 
-sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR" "$STAGE_DIR"
-sudo chmod 777 "$STAGE_DIR"
+sudo mkdir -p "$SOURCE_DIR" /var/lib/docker/volumes "$BACKUP_DIR"
+# Audit Fix (R5-6): Ensure runner owns BACKUP_DIR so unprivileged rclone copyto can write SQL dumps
+sudo chown -R "$(id -un):docker" "$BACKUP_DIR" 2>/dev/null || sudo chmod 777 "$BACKUP_DIR"
+
+# Audit Fix (C1 / R5-7): Force-recreate staging directory as runner-owned 0700 to prevent pre-creation DoS/tampering
+sudo rm -rf "$STAGE_DIR" 2>/dev/null || true
+mkdir -p "$STAGE_DIR" && chmod 700 "$STAGE_DIR"
 
 # Helper for staged, verified download and extraction (prevents partial extract on 403s)
 stage_and_extract() {
@@ -26,7 +31,10 @@ stage_and_extract() {
   local local_stage="${STAGE_DIR}/${remote_file}"
 
   echo "[COOLIFY-RESTORE] Checking for ${remote_file} in ${STORAGE_TARGET}..."
-  if rclone lsf --drive-use-trash=false "${STORAGE_TARGET}" 2>/dev/null | grep -qx "${remote_file}"; then
+  # Audit Fix (C4): Capture listing to variable first to prevent SIGPIPE exit 141 under pipefail
+  local remote_files
+  remote_files=$(rclone lsf --drive-use-trash=false "${STORAGE_TARGET}" 2>/dev/null || true)
+  if printf '%s\n' "$remote_files" | grep -qx "${remote_file}"; then
     echo "[COOLIFY-RESTORE] Staging ${remote_file} to local NVMe storage..."
     rclone copyto --drive-chunk-size=512M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 --low-level-retries=10 \
       "${STORAGE_TARGET}/${remote_file}" "$local_stage"
@@ -36,16 +44,47 @@ stage_and_extract() {
       return 1
     fi
 
+    # Audit Hardening (P5): Test gzip stream integrity before attempting root extraction
+    echo "[COOLIFY-RESTORE] Testing ${remote_file} archive integrity before extraction..."
+    if ! gzip -t "$local_stage" 2>/dev/null; then
+      echo "[COOLIFY-RESTORE] CRITICAL: ${remote_file} failed gzip archive test! Archive is corrupt/truncated. Aborting extraction."
+      sudo rm -f "$local_stage"
+      return 1
+    fi
+
     echo "[COOLIFY-RESTORE] Extracting ${remote_file} into ${target_dir}..."
+    set +e
     if command -v pigz >/dev/null 2>&1; then
       pigz -dc -p 4 "$local_stage" | sudo tar --numeric-owner -xpf - -C "$target_dir"
+      local tar_ps=("${PIPESTATUS[@]}")
+      local pigz_rc="${tar_ps[0]:-0}"
+      local extract_rc="${tar_ps[1]:-0}"
+      if [ "$pigz_rc" -ne 0 ]; then
+        echo "[COOLIFY-RESTORE] CRITICAL: pigz decompression failed on ${remote_file} (rc=$pigz_rc)!"
+        sudo rm -f "$local_stage"
+        return 1
+      fi
     else
       sudo tar --numeric-owner -xpzf "$local_stage" -C "$target_dir"
+      local extract_rc=$?
     fi
+    set -e
+
+    if [ "$extract_rc" -ne 0 ]; then
+      echo "[COOLIFY-RESTORE] CRITICAL: tar extraction failed on ${remote_file} (rc=$extract_rc)!"
+      sudo rm -f "$local_stage"
+      return 1
+    fi
+
     sudo rm -f "$local_stage"
     echo "[COOLIFY-RESTORE] ${remote_file} successfully hydrated."
   else
-    echo "[COOLIFY-RESTORE] Notice: ${remote_file} not found on remote storage."
+    if [ "${CYCLE_COUNT:-0}" != "0" ]; then
+      echo "[COOLIFY-RESTORE] CRITICAL: ${remote_file} missing from remote storage on cycle ${CYCLE_COUNT}! Aborting to trigger circuit breaker."
+      return 1
+    else
+      echo "[COOLIFY-RESTORE] Notice: ${remote_file} not found on remote storage (Cycle 0 bootstrap)."
+    fi
   fi
 }
 
@@ -56,18 +95,53 @@ stage_and_extract "volumes_bundle.tar.gz" "/var/lib/docker/volumes"
 # Restart Docker daemon to index all extracted volumes
 echo "[COOLIFY-RESTORE] Reloading Docker daemon to recognize restored volumes..."
 sudo systemctl restart docker 2>/dev/null || sudo service docker restart 2>/dev/null || true
+DOCKER_READY=false
 for chk in {1..15}; do
   if sudo docker info >/dev/null 2>&1; then
     echo "[COOLIFY-RESTORE] Docker daemon ready ($((chk*2))s)."
+    DOCKER_READY=true
     break
   fi
   sleep 2
 done
 
+if [ "$DOCKER_READY" != "true" ]; then
+  echo "[COOLIFY-RESTORE] WARNING: Docker daemon not responding after 30s. Checking service status..."
+  sudo systemctl status docker --no-pager 2>/dev/null || sudo service docker status 2>/dev/null || true
+fi
+
 # 3. Pull standalone PostgreSQL dump
 echo "[COOLIFY-RESTORE] Staging PostgreSQL dump..."
 rclone copyto --drive-chunk-size=512M --drive-pacer-min-sleep=10ms --buffer-size=64M --use-mmap --drive-use-trash=false --retries=5 \
   "${STORAGE_TARGET}/coolify_pg_latest.sql.gz" "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null || true
+
+# Audit Fix (C3 / R5-3 / R5-4): Validate downloaded PostgreSQL dump integrity if present
+if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
+  if [ -s "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
+    if ! gzip -t "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null; then
+      echo "[COOLIFY-RESTORE] CRITICAL: Downloaded coolify_pg_latest.sql.gz is corrupt (gzip -t failed)! Aborting to prevent empty DB overwrite."
+      sudo rm -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz"
+      exit 1
+    elif ! (pigz -dc "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null || gzip -dc "${BACKUP_DIR}/coolify_pg_latest.sql.gz" 2>/dev/null) | tail -c 1024 | grep -q 'PostgreSQL database dump complete'; then
+      echo "[COOLIFY-RESTORE] CRITICAL: Downloaded coolify_pg_latest.sql.gz is truncated (missing completion sentinel)! Aborting to prevent empty DB overwrite."
+      sudo rm -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz"
+      exit 1
+    else
+      echo "[COOLIFY-RESTORE] Downloaded coolify_pg_latest.sql.gz verified intact with valid completion sentinel."
+    fi
+  else
+    echo "[COOLIFY-RESTORE] CRITICAL: Downloaded coolify_pg_latest.sql.gz is 0 bytes! Aborting."
+    sudo rm -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz"
+    exit 1
+  fi
+else
+  if [ "${CYCLE_COUNT:-0}" != "0" ]; then
+    echo "[COOLIFY-RESTORE] CRITICAL: coolify_pg_latest.sql.gz missing on remote storage on cycle ${CYCLE_COUNT}! Aborting."
+    exit 1
+  else
+    echo "[COOLIFY-RESTORE] Notice: coolify_pg_latest.sql.gz not found on remote storage (Cycle 0 bootstrap)."
+  fi
+fi
 sudo rm -rf "$STAGE_DIR"
 
 # ==============================================================================
@@ -82,8 +156,13 @@ if [ -d "/data/coolify/ssh/keys" ]; then
   sudo chmod 644 /data/coolify/ssh/keys/*.pub 2>/dev/null || true
 fi
 
-# Ensure docker volume root exists without corrupting Postgres 0700/0750 permissions
-sudo chmod 755 /var/lib/docker /var/lib/docker/volumes 2>/dev/null || true
+# Audit Fix (C12 / R5-5): Ensure docker root and volume permissions default to 0710 root:docker (do not world-expose container secrets)
+sudo chmod 710 /var/lib/docker /var/lib/docker/volumes 2>/dev/null || true
+
+# Initialize public scratch & dustbin directories on host for transient downloads/scratch work (Audit Fix: sticky bit 1777)
+echo "[COOLIFY-RESTORE] Initializing scratch & dustbin space (/tmp/dustbin)..."
+sudo mkdir -p /tmp/dustbin /tmp/scratch
+sudo chmod 1777 /tmp/dustbin /tmp/scratch 2>/dev/null || true
 
 # ==============================================================================
 # SAFEGUARD 2: Localhost SSH Injection & Daemon Hardening
@@ -169,16 +248,18 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
   # Restore PostgreSQL dump if available
   if [ -f "${BACKUP_DIR}/coolify_pg_latest.sql.gz" ]; then
     echo "[COOLIFY-RESTORE] Restoring PostgreSQL database from dump..."
+    # Audit Fix (B-NEW-2): Do not pass ON_ERROR_STOP=1 because pg_dumpall --clean attempts to DROP bootstrap superuser 'coolify' which PG refuses.
+    # Instead, restore and verify database contents structurally with the post-restore sanity check.
     if command -v pigz >/dev/null 2>&1; then
       pigz -dc -p 4 "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
     else
       gunzip -c "${BACKUP_DIR}/coolify_pg_latest.sql.gz" | sudo docker exec -i coolify-db psql -U coolify -d postgres 2>/dev/null || true
     fi
-    echo "[COOLIFY-RESTORE] Database restored successfully."
 
     # Post-Restore Sanity Check: If compose projects exist on disk, database records must not be zero!
+    # Audit Fix: Always verify structural database records (even on cycle 0 if projects exist on disk)
     DISK_COMPOSE_COUNT=$(sudo find /data/coolify/services /data/coolify/applications /data/coolify/databases -name "docker-compose.yml" 2>/dev/null | wc -l || echo 0)
-    if [ "$DISK_COMPOSE_COUNT" -gt 0 ] && [ "${CYCLE_COUNT:-0}" != "0" ]; then
+    if [ "$DISK_COMPOSE_COUNT" -gt 0 ]; then
       DB_PASS=$(grep '^DB_PASSWORD=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || true)
       DB_USER=$(grep '^DB_USERNAME=' /data/coolify/source/.env 2>/dev/null | head -n 1 | cut -d= -f2- | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//' | tr -d '\r\n' || echo "coolify")
       DB_SVCS=$(sudo docker exec -e PGPASSWORD="$DB_PASS" -i coolify-db psql -U "$DB_USER" -d coolify -t -A -c "SELECT count(*) FROM services;" 2>/dev/null | tr -cd '0-9' || echo 0)
@@ -195,7 +276,10 @@ if [ -f "/data/coolify/source/docker-compose.yml" ] && [ -f "/data/coolify/sourc
         echo "[COOLIFY-RESTORE] Halting to trigger circuit breaker and prevent blank state overwrite."
         exit 1
       fi
-      echo "[COOLIFY-RESTORE] Database sanity check passed: $TOTAL_RECORDS records verified for $DISK_COMPOSE_COUNT compose stack(s)."
+      # Audit Fix (C5): Success is announced only AFTER verification succeeds
+      echo "[COOLIFY-RESTORE] Database restored & verified successfully: $TOTAL_RECORDS records verified for $DISK_COMPOSE_COUNT compose stack(s)."
+    else
+      echo "[COOLIFY-RESTORE] Database restored successfully (no compose stacks detected on disk)."
     fi
   fi
 
@@ -471,39 +555,42 @@ if [ ${#ACTIVE_COMPOSE[@]} -gt 0 ]; then
     done
   fi
 
-  # F1 Hardening: Hermes reconciliation scoped strictly by volume role suffix
+  # F1 Hardening (R8-1, R8-2, R8-3, R8-4): Hermes reconciliation scoped strictly by volume role suffix
   # Prevents role contamination across distinct mounts: hermes-home, hermes-agent-src, hermes-workspace
   HERMES_ROLES=("hermes-home" "hermes-agent-src" "hermes-workspace")
   for role in "${HERMES_ROLES[@]}"; do
     ACTIVE_ROLE_VOL=""
-    # 1. First attempt to derive active role volume from ACTIVE_COMPOSE
+    # 1. First attempt to derive active role volume from verified ACTIVE_COMPOSE (R8-4: support hyphens and underscores)
     for act_cmp in "${ACTIVE_COMPOSE[@]}"; do
       if grep -q "hermes" "$act_cmp" 2>/dev/null; then
-        parsed_role_vol=$(grep -E "[a-z0-9]+_${role}:" "$act_cmp" 2>/dev/null | head -n 1 | sed -E "s/.*- ['\"']?([a-z0-9_]+_${role}).*/\1/" | tr -d ' ' || true)
-        if [ -n "$parsed_role_vol" ]; then
+        parsed_role_vol=$(grep -E "[a-z0-9_-]+_${role}:" "$act_cmp" 2>/dev/null | head -n 1 | sed -E "s/.*- ['\"']?([a-z0-9_-]+_${role}).*/\1/" | tr -d ' ' || true)
+        if [ -n "$parsed_role_vol" ] && [ -d "/var/lib/docker/volumes/$parsed_role_vol" ]; then
           ACTIVE_ROLE_VOL="$parsed_role_vol"
           break
         fi
       fi
     done
 
-    # 2. Fallback to newest volume matching this specific role suffix
-    if [ -z "$ACTIVE_ROLE_VOL" ] || [ ! -d "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL" ]; then
-      ACTIVE_ROLE_VOL=$(sudo ls -td /var/lib/docker/volumes/*"${role}"* 2>/dev/null | head -n 1 | xargs -r basename || true)
+    # 2. R8-2: Fail closed if compose does not designate an active role volume to prevent orphan stack contamination
+    if [ -z "$ACTIVE_ROLE_VOL" ]; then
+      echo "[COOLIFY-RESTORE] Notice: No active compose volume found matching role suffix _${role}. Skipping reconciliation for this role."
+      continue
     fi
 
-    # 3. Non-clobber reconcile only from older volumes sharing the exact same role
-    if [ -n "$ACTIVE_ROLE_VOL" ] && [ -d "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data" ]; then
-      for older_role_vol in $(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*${role}*" -type d ! -name "$ACTIVE_ROLE_VOL" 2>/dev/null); do
+    # 3. Non-clobber reconcile only from older volumes sharing the exact same role suffix (R8-1: *_${role}, R8-3: safe IFS loop)
+    if [ -d "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data" ]; then
+      while IFS= read -r older_role_vol; do
+        [ -z "$older_role_vol" ] && continue
         if [ -d "$older_role_vol/_data" ]; then
           older_cnt=$(sudo find "$older_role_vol/_data" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
           active_cnt=$(sudo find "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ' || echo 0)
-          if [ "$older_cnt" -gt "$active_cnt" ] || [ "$active_cnt" -le 2 ]; then
+          # R8-2: Only copy if older volume genuinely contains more files than active volume; drop loose -le 2 threshold
+          if [ "$older_cnt" -gt "$active_cnt" ]; then
             echo "[COOLIFY-RESTORE] Restoring older $role state from $older_role_vol into $ACTIVE_ROLE_VOL (no-clobber)..."
             sudo cp -an "$older_role_vol/_data/." "/var/lib/docker/volumes/$ACTIVE_ROLE_VOL/_data/" 2>/dev/null || true
           fi
         fi
-      done
+      done < <(sudo find /var/lib/docker/volumes -maxdepth 1 -name "*_${role}" -type d ! -name "$ACTIVE_ROLE_VOL" 2>/dev/null)
     fi
   done
 
