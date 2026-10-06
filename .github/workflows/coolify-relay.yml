@@ -506,9 +506,7 @@ jobs:
           # 2. Create verified synchronization flag with JSON metadata (M-2)
           echo "Creating verified JSON synchronization flag on Google Drive..."
           NOW_EPOCH=$(date +%s)
-          cat <<EOF > /tmp/sync_complete.flag
-{"node":"${GITHUB_REPOSITORY}","cycle":${CYCLE},"timestamp":${NOW_EPOCH}}
-EOF
+          printf '{"node":"%s","cycle":%s,"timestamp":%s}\n' "${GITHUB_REPOSITORY}" "${CYCLE}" "${NOW_EPOCH}" > /tmp/sync_complete.flag
           rclone copyto --drive-use-trash=false /tmp/sync_complete.flag "${TARGET}/control/sync_complete.flag"
           echo "Handover synchronization flag successfully written to Google Drive."
 
