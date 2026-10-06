@@ -80,17 +80,22 @@ jobs:
           fi
 
           # Fail-Closed Guard: For any cycle > 0, state recovery is mandatory
+          REMOTE_BASELINE_EXISTS=false
+          if awk '{print $NF}' /tmp/prewarm_ls.txt | grep -qx "coolify_bundle.tar.gz"; then
+            REMOTE_BASELINE_EXISTS=true
+          fi
+
           if [ "$CYCLE" != "0" ]; then
             echo "Cycle ${CYCLE} detected. Verifying remote state baseline existence on Google Drive..."
-            if ! grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
-              echo "CRITICAL: Cycle is ${CYCLE} but 'coolify_bundle.tar.gz' is missing from Google Drive!"
+            if [ "$REMOTE_BASELINE_EXISTS" != "true" ]; then
+              echo "CRITICAL: Cycle is ${CYCLE} but exact 'coolify_bundle.tar.gz' is missing from Google Drive!"
               echo "Halting pre-warm to prevent blank state overwrite."
               exit 1
             fi
             echo "Google Drive state baseline confirmed present for Cycle ${CYCLE}."
           else
             # Cycle 0: Check if existing baseline exists on Google Drive
-            if grep -q "coolify_bundle.tar.gz" /tmp/prewarm_ls.txt; then
+            if [ "$REMOTE_BASELINE_EXISTS" = "true" ]; then
               echo "Cycle 0 with existing Google Drive baseline detected. Verified restore will run in Phase 2."
             fi
           fi
@@ -104,14 +109,9 @@ jobs:
           sudo docker pull postgres:15-alpine || sudo docker pull postgres:16-alpine || true
           sudo docker pull redis:7-alpine || sudo docker pull redis:alpine || true
 
-          # Strict Fail-Closed Check: Never bootstrap blank install if cycle > 0
-          if [ ! -f "/data/coolify/source/docker-compose.yml" ]; then
-            if [ "$CYCLE" != "0" ]; then
-              echo "CRITICAL ERROR: Cycle is ${CYCLE} but no compose files exist! Aborting to trigger Circuit Breaker."
-              exit 1
-            fi
-
-            echo "First-time installation authorized for Cycle 0. Bootstrapping Coolify..."
+          # Deterministic First-Time Bootstrap vs Verified Hydration (Audit Hardened: H-1 / M-1)
+          if [ "$CYCLE" = "0" ] && [ "$REMOTE_BASELINE_EXISTS" != "true" ]; then
+            echo "First-time clean bootstrap authorized for Cycle 0 (no remote baseline). Bootstrapping Coolify..."
             curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash -s -- -f || true
 
             if [ -f "/data/coolify/source/.env" ]; then
@@ -129,6 +129,8 @@ jobs:
               fi
               sleep 2
             done
+          else
+            echo "Remote baseline detected or Cycle > 0. Skipping blank bootstrap; Phase 2 will hydrate state."
           fi
 
           echo "Pre-warming completed successfully."
@@ -161,7 +163,6 @@ jobs:
             "ember-ops1/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
-            "silver-demon60/coolify-relay"
             "12stack-phantom/coolify-relay"
           )
           CURRENT_INDEX=-1
@@ -207,19 +208,44 @@ jobs:
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -euo pipefail
           echo "=== PHASE 2 & 3: Handshake, State Hydration & Ingress Claim ==="
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
           CYCLE="${CYCLE_COUNT:-0}"
 
-          # If rotation cycle > 0, await predecessor sync_complete.flag
+          # If rotation cycle > 0, await predecessor sync_complete.flag with metadata & freshness validation (M-2)
           if [ "$CYCLE" != "0" ]; then
             echo "Awaiting predecessor delta synchronization flag on Google Drive..."
             FLAG_FOUND=false
             for sec in {1..100}; do
-              if rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
-                echo "Predecessor sync_complete flag detected ($((sec * 6))s)."
+              FLAG_RAW=$(rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true)
+              if [ -n "$FLAG_RAW" ]; then
+                echo "Predecessor sync_complete flag detected ($((sec * 6))s): $FLAG_RAW"
+
+                # Validate expected predecessor cycle (N-5 fix)
+                FLAG_CYCLE=$(echo "$FLAG_RAW" | jq -r '.cycle // empty' 2>/dev/null || true)
+                EXPECTED_CYCLE=$((CYCLE - 1))
+                if [ -n "$FLAG_CYCLE" ] && [ "$FLAG_CYCLE" != "$EXPECTED_CYCLE" ]; then
+                  echo "WARNING: Flag cycle (${FLAG_CYCLE}) does not match expected predecessor cycle (${EXPECTED_CYCLE})! Skipping stale flag..."
+                  sleep 6
+                  continue
+                fi
+
+                # Validate timestamp freshness
+                FLAG_TS=$(echo "$FLAG_RAW" | jq -r '.timestamp // empty' 2>/dev/null || true)
+                NOW_TS=$(date +%s)
+                if [ -n "$FLAG_TS" ] && [ "$FLAG_TS" -gt 0 ] 2>/dev/null; then
+                  AGE=$(( NOW_TS - FLAG_TS ))
+                  if [ "$AGE" -lt 0 ] || [ "$AGE" -gt 3600 ]; then
+                    echo "WARNING: Flag age (${AGE}s) exceeds 3600s threshold or is invalid! Skipping stale flag..."
+                    sleep 6
+                    continue
+                  fi
+                  echo "Flag verified: cycle ${FLAG_CYCLE} is correct, age is ${AGE}s (fresh)."
+                fi
                 FLAG_FOUND=true
                 break
               fi
@@ -285,7 +311,6 @@ jobs:
             "ember-ops1/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
-            "silver-demon60/coolify-relay"
             "12stack-phantom/coolify-relay"
           )
           CURRENT_INDEX=-1
@@ -313,19 +338,66 @@ jobs:
       - name: Phase 2/3 Hydration Failure Emergency Handler
         if: failure() && steps.prewarm.outcome == 'success'
         env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          FALLBACK_PAT: ${{ secrets.FALLBACK_PAT }}
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          RETRY_DEPTH: ${{ github.event.inputs.retry_depth }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           echo "=== EMERGENCY: Phase 2/3 Hydration or Ingress Failed on ${GITHUB_REPOSITORY} ==="
           TARGET="${STORAGE_TARGET:-gdrive:coolify-relay-state/coolify-state}"
           CYCLE="${CYCLE_COUNT:-0}"
+          DEPTH=${RETRY_DEPTH:-0}
 
-          # 1. Clean up handshake flag so predecessor knows successor died and doesn't assume success
-          echo "Removing sync_complete.flag to alert predecessor..."
-          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          # Check if sync_complete.flag was already cleared by this runner before failure
+          FLAG_STILL_EXISTS=false
+          if rclone cat --drive-use-trash=false "${TARGET}/control/sync_complete.flag" >/dev/null 2>&1; then
+            FLAG_STILL_EXISTS=true
+            echo "Pre-claim failure detected: sync_complete.flag is intact on Google Drive."
+          fi
 
-          # 2. Fire Critical Telegram Emergency Alert to page human operator
-          python3 scripts/coolify/notify_tg.py "🚨 <b>CRITICAL CLUSTER FAILURE:</b>%0A• <b>Failed Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Stage:</b> State Hydration / Cloudflare Ingress%0A• <b>Action Required:</b> Successor failed before takeover. Please inspect logs and trigger manual re-dispatch with cycle_count=${CYCLE}." 2>/dev/null || true
+          if [ "$FLAG_STILL_EXISTS" = "true" ]; then
+            # Pre-claim failure: Baseline and flag are intact. Fallback node can safely consume flag and hydrate (N-1 fix)
+            echo "Pre-claim failure detected. Automatic failover to fallback node authorized."
+            python3 scripts/coolify/notify_tg.py "🚨 <b>PRE-CLAIM HYDRATION FAILURE:</b>%0A• <b>Failed Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Action:</b> Triggering automatic circuit breaker fallback dispatch." 2>/dev/null || true
+
+            if [ "$DEPTH" -lt 2 ]; then
+              NEW_DEPTH=$((DEPTH + 1))
+              REPOS=(
+                "ember-ops1/coolify-relay"
+                "moss-and-wire/coolify-relay"
+                "pixel-crafter1/coolify-relay"
+                "12stack-phantom/coolify-relay"
+              )
+              CURRENT_INDEX=-1
+              for i in "${!REPOS[@]}"; do
+                if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
+                  CURRENT_INDEX=$i
+                  break
+                fi
+              done
+              [ $CURRENT_INDEX -eq -1 ] && CURRENT_INDEX=0
+              FALLBACK_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+              FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
+
+              echo "Executing automated emergency dispatch to ${FALLBACK_TARGET} (retry_depth=${NEW_DEPTH})..."
+              GH_TOKEN="$FALLBACK_PAT" gh workflow run coolify-relay.yml \
+                --repo "$FALLBACK_TARGET" \
+                --ref main \
+                -f cycle_count="$CYCLE" \
+                -f retry_depth="$NEW_DEPTH" \
+                -f test_handover="${TEST_HANDOVER:-0}" || echo "Emergency fallback dispatch failed!"
+            else
+              echo "Max retry depth ($DEPTH) reached. Halting automatic failover."
+            fi
+          else
+            # Post-claim failure: Flag already consumed. Do not double-dispatch un-synchronized successor.
+            echo "Post-claim failure detected (flag already consumed). Manual operator recovery required."
+            python3 scripts/coolify/notify_tg.py "🚨 <b>CRITICAL POST-CLAIM INGRESS FAILURE:</b>%0A• <b>Failed Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• <b>Stage:</b> Ingress Takeover / Verification%0A• <b>Action Required:</b> Handshake flag was already consumed. Manual re-dispatch required with cycle_count=${CYCLE}." 2>/dev/null || true
+          fi
 
       # =====================================================================
       # PHASE 4: 320m PRODUCTION SHIFT & WATCHDOG
@@ -337,6 +409,8 @@ jobs:
           STORAGE_TARGET: ${{ secrets.STORAGE_TARGET }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
           TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           set -euo pipefail
           echo "=== PHASE 4: Production Shift Active ==="
@@ -415,25 +489,34 @@ jobs:
           echo "=== HANDOVER THRESHOLD REACHED (${HANDOVER_MINUTE}m) ==="
           python3 scripts/coolify/notify_tg.py "❄️ <b>FREEZING AND BACKING UP!</b>%0APlease do not make any changes or deployments right now. Syncing universal delta to Google Drive and dispatching successor..." 2>/dev/null || true
 
+          # 0. Delete any pre-existing stale flag before initiating freeze & upload (M-2)
+          echo "Clearing any pre-existing sync_complete flag from prior runs..."
+          rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+
           # 1. Execute Atomic Delta Freeze & Upload to Google Drive (P0-2 Hardened: fail-closed)
           echo "Executing Multi-Core Delta Freeze & Sync..."
           chmod +x scripts/coolify/sync_delta.sh
           if ! ./scripts/coolify/sync_delta.sh "$TARGET"; then
             echo "::error::sync_delta.sh failed during handover! Aborting handover to protect state baseline."
-            python3 scripts/coolify/notify_tg.py "🚨 <b>HANDOVER BACKUP FAILED:</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• State sync failed. Ingress kept active to prevent torn state." 2>/dev/null || true
+            python3 scripts/coolify/notify_tg.py "🚨 <b>HANDOVER BACKUP FAILED:</b>%0A• <b>Node:</b> ${GITHUB_REPOSITORY}%0A• <b>Cycle:</b> ${CYCLE}%0A• State sync failed. Handover aborted." 2>/dev/null || true
             rclone delete --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
             exit 1
           fi
 
-          # 2. Create synchronization flag on Google Drive only after verified backup success
-          rclone touch --drive-use-trash=false "${TARGET}/control/sync_complete.flag" 2>/dev/null || true
+          # 2. Create verified synchronization flag with JSON metadata (M-2)
+          echo "Creating verified JSON synchronization flag on Google Drive..."
+          NOW_EPOCH=$(date +%s)
+          cat <<EOF > /tmp/sync_complete.flag
+{"node":"${GITHUB_REPOSITORY}","cycle":${CYCLE},"timestamp":${NOW_EPOCH}}
+EOF
+          rclone copyto --drive-use-trash=false /tmp/sync_complete.flag "${TARGET}/control/sync_complete.flag"
+          echo "Handover synchronization flag successfully written to Google Drive."
 
           # 3. Dispatch successor runner across the ring BEFORE releasing ingress
           REPOS=(
             "ember-ops1/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
-            "silver-demon60/coolify-relay"
             "12stack-phantom/coolify-relay"
           )
           CURRENT_INDEX=-1
@@ -451,33 +534,69 @@ jobs:
           FALLBACK_TARGET="${REPOS[$FALLBACK_INDEX]}"
           NEXT_CYCLE=$((CYCLE + 1))
 
-          dispatch_runner() {
+          dispatch_and_verify_runner() {
             local target="$1"
             local token="$2"
-            for attempt in 1 2 3 4; do
-              echo "Dispatch attempt $attempt to ${target}..."
-              if GH_TOKEN="$token" gh workflow run coolify-relay.yml \
-                --repo "$target" \
-                --ref main \
-                -f cycle_count="$NEXT_CYCLE" \
-                -f retry_depth="0" \
-                -f test_handover="${TEST_HANDOVER:-0}"; then
-                echo "Successfully triggered workflow on ${target}."
-                return 0
+            echo "Dispatching workflow run to ${target} (cycle=${NEXT_CYCLE})..."
+            local dispatch_epoch
+            dispatch_epoch=$(date +%s)
+
+            if ! GH_TOKEN="$token" gh workflow run coolify-relay.yml \
+              --repo "$target" \
+              --ref main \
+              -f cycle_count="$NEXT_CYCLE" \
+              -f retry_depth="0" \
+              -f test_handover="${TEST_HANDOVER:-0}"; then
+              echo "Workflow dispatch command failed against ${target}."
+              return 1
+            fi
+
+            echo "Polling ${target} for live run execution (up to 120s)..."
+            for poll in {1..24}; do
+              sleep 5
+              local run_info
+              run_info=$(GH_TOKEN="$token" gh run list --repo "$target" --workflow coolify-relay.yml --limit 5 \
+                --json databaseId,status,createdAt 2>/dev/null || echo "")
+              if [ -n "$run_info" ]; then
+                local active_id
+                active_id=$(echo "$run_info" | jq -r --argjson dep "$dispatch_epoch" '
+                  .[] | select(
+                    (.status == "in_progress" or .status == "queued") and
+                    ((.createdAt | fromdateiso8601? // 0) >= ($dep - 15))
+                  ) | .databaseId' 2>/dev/null | head -n 1 || true)
+                if [ -n "$active_id" ] && [ "$active_id" != "null" ]; then
+                  echo "SUCCESS: Verified active run (#${active_id}) on ${target}."
+                  return 0
+                fi
               fi
-              sleep 15
             done
+            echo "WARNING: No active run detected on ${target} after 120s."
             return 1
           }
 
           DISPATCH_SUCCESS=false
-          echo "Dispatching successor runner to ${PRIMARY_TARGET}..."
-          if dispatch_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
+          echo "Dispatching successor runner to primary target: ${PRIMARY_TARGET}..."
+          PRIMARY_DISPATCH_EPOCH=$(date +%s)
+          if dispatch_and_verify_runner "$PRIMARY_TARGET" "$NEXT_PAT"; then
             DISPATCH_SUCCESS=true
           else
-            echo "Primary dispatch failed. Activating fallback: ${FALLBACK_TARGET}..."
-            if dispatch_runner "$FALLBACK_TARGET" "$FALLBACK_PAT"; then
+            echo "Primary target ${PRIMARY_TARGET} failed or dead. Activating fallback: ${FALLBACK_TARGET}..."
+            if dispatch_and_verify_runner "$FALLBACK_TARGET" "$FALLBACK_PAT"; then
               DISPATCH_SUCCESS=true
+              # Race Mitigation (H-2 / N-4 fix): Cancel late-starting primary run filtered by dispatch epoch
+              LATE_PRIMARY_INFO=$(GH_TOKEN="$NEXT_PAT" gh run list --repo "$PRIMARY_TARGET" --workflow coolify-relay.yml --limit 3 \
+                --json databaseId,status,createdAt 2>/dev/null || echo "")
+              if [ -n "$LATE_PRIMARY_INFO" ]; then
+                LATE_PRIMARY_ID=$(echo "$LATE_PRIMARY_INFO" | jq -r --argjson dep "$PRIMARY_DISPATCH_EPOCH" '
+                  .[] | select(
+                    (.status == "in_progress" or .status == "queued") and
+                    ((.createdAt | fromdateiso8601? // 0) >= ($dep - 15))
+                  ) | .databaseId' 2>/dev/null | head -n 1 || true)
+                if [ -n "$LATE_PRIMARY_ID" ] && [ "$LATE_PRIMARY_ID" != "null" ]; then
+                  echo "Cancelling late-starting primary run #${LATE_PRIMARY_ID} on ${PRIMARY_TARGET}..."
+                  GH_TOKEN="$NEXT_PAT" gh run cancel "$LATE_PRIMARY_ID" --repo "$PRIMARY_TARGET" 2>/dev/null || true
+                fi
+              fi
             fi
           fi
 
