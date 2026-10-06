@@ -172,10 +172,10 @@ sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -
 
 sudo mkdir -p /etc/ssh/sshd_config.d
 cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/99-coolify.conf >/dev/null
-PermitRootLogin yes
 PubkeyAuthentication yes
-StrictModes no
-AuthorizedKeysFile .ssh/authorized_keys
+PermitRootLogin no
+Match Address 172.16.0.0/12,127.0.0.1,::1
+    PermitRootLogin prohibit-password
 EOF
 
 sudo systemctl enable ssh 2>/dev/null || sudo systemctl enable sshd 2>/dev/null || true
@@ -198,7 +198,7 @@ sudo chmod 644 /data/coolify/ssh/keys/*.pub 2>/dev/null || true
 sudo chown -R 9999:root /data/coolify/ssh 2>/dev/null || true
 
 sudo mkdir -p /root/.ssh /home/runner/.ssh
-echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIINGMEL5LpxfXWB1Q2gd028oYZzpuGe97jlmgbYza+pN" | sudo tee -a /root/.ssh/authorized_keys /home/runner/.ssh/authorized_keys >/dev/null
+# Audit Hardening (H-4): Dynamically populate authorized_keys from restored Coolify keys exclusively; no hardcoded keys
 
 for priv in /data/coolify/ssh/keys/*; do
   if [ -f "$priv" ] && [[ ! "$priv" =~ \.pub$ ]] && [[ ! "$priv" =~ \.lock$ ]]; then
