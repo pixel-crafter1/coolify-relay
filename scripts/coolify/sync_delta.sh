@@ -128,6 +128,15 @@ fi
 if [ -f "/data/coolify/source/docker-compose.yml" ]; then
   (cd /data/coolify/source && sudo docker compose --env-file .env -f docker-compose.yml -f docker-compose.prod.yml stop -t 10 coolify coolify-db 2>/dev/null || \
    cd /data/coolify/source && sudo docker compose stop -t 10 coolify coolify-db 2>/dev/null || true)
+
+  # Audit Hardening (M-3): Fail-closed container stop assertion to prevent split-brain behind shared tunnel
+  STILL_RUNNING=$(sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(coolify|coolify-db)$' || true)
+  if [ -n "$STILL_RUNNING" ]; then
+    echo "[COOLIFY-SYNC] CRITICAL: Failed to stop core engine containers: $STILL_RUNNING! Attempting recovery before abort."
+    (cd /data/coolify/source && sudo docker compose --env-file .env -f docker-compose.yml -f docker-compose.prod.yml up -d coolify coolify-db 2>/dev/null || true)
+    exit 1
+  fi
+  echo "[COOLIFY-SYNC] Core Coolify engine containers successfully stopped."
 fi
 
 # Resilient file-backed upload helper (Native Google Drive resumable multi-part upload with automatic retries)
