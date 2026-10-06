@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
+import os
 import sys
 import json
 import urllib.request
 import urllib.error
 
-# Usage: python3 scripts/coolify/notify_tg.py "Message text here"
-BOT_TOKEN = "8663728382:AAHUYJtD4eZe2Ac1fQ4eiFanV_LO_sOr0fo"
-CHAT_ID = "1316077326"
+# Runtime credentials must be provided via environment variables (GitHub Actions secrets)
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 
 def send_alert(message: str):
     if not message:
+        return
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[TG-ALERT] WARNING: TG_BOT_TOKEN or TG_CHAT_ID is missing from environment. Alert not delivered.", file=sys.stderr)
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = json.dumps({
