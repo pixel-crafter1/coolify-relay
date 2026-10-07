@@ -539,13 +539,24 @@ jobs:
             local dispatch_epoch
             dispatch_epoch=$(date +%s)
 
-            if ! GH_TOKEN="$token" gh workflow run coolify-relay.yml \
-              --repo "$target" \
-              --ref main \
-              -f cycle_count="$NEXT_CYCLE" \
-              -f retry_depth="0" \
-              -f test_handover="${TEST_HANDOVER:-0}"; then
-              echo "Workflow dispatch command failed against ${target}."
+            local dispatched=false
+            for attempt in 1 2 3 4; do
+              if GH_TOKEN="$token" gh workflow run coolify-relay.yml \
+                --repo "$target" \
+                --ref main \
+                -f cycle_count="$NEXT_CYCLE" \
+                -f retry_depth="0" \
+                -f test_handover="${TEST_HANDOVER:-0}"; then
+                dispatched=true
+                break
+              else
+                echo "Workflow dispatch attempt $attempt failed against ${target}. Retrying in $((attempt * 8))s..."
+                sleep $((attempt * 8))
+              fi
+            done
+
+            if [ "$dispatched" != "true" ]; then
+              echo "Workflow dispatch command failed against ${target} after 4 attempts."
               return 1
             fi
 
