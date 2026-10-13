@@ -164,6 +164,8 @@ jobs:
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
             "12stack-phantom/coolify-relay"
+            "nova-matrix1/coolify-relay"
+            "orbit-devs12/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -312,6 +314,8 @@ jobs:
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
             "12stack-phantom/coolify-relay"
+            "nova-matrix1/coolify-relay"
+            "orbit-devs12/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -516,6 +520,8 @@ jobs:
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
             "12stack-phantom/coolify-relay"
+            "nova-matrix1/coolify-relay"
+            "orbit-devs12/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
