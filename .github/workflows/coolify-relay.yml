@@ -160,12 +160,12 @@ jobs:
           echo "Executing fallback dispatch to next ring node with retry_depth=${NEW_DEPTH}..."
 
           REPOS=(
-            "ember-ops1/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
             "12stack-phantom/coolify-relay"
-            "nova-matrix1/coolify-relay"
-            "orbit-devs12/coolify-relay"
+            "ihjjjhknjkj8878/coolify-relay"
+            "nether-mine-dev/coolify-relay"
+            "mine-stack1/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -310,12 +310,12 @@ jobs:
 
           # Cancel predecessor runner run to release GitHub concurrency
           REPOS=(
-            "ember-ops1/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
             "12stack-phantom/coolify-relay"
-            "nova-matrix1/coolify-relay"
-            "orbit-devs12/coolify-relay"
+            "ihjjjhknjkj8878/coolify-relay"
+            "nether-mine-dev/coolify-relay"
+            "mine-stack1/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -371,10 +371,12 @@ jobs:
             if [ "$DEPTH" -lt 2 ]; then
               NEW_DEPTH=$((DEPTH + 1))
               REPOS=(
-                "ember-ops1/coolify-relay"
                 "moss-and-wire/coolify-relay"
                 "pixel-crafter1/coolify-relay"
                 "12stack-phantom/coolify-relay"
+                "ihjjjhknjkj8878/coolify-relay"
+                "nether-mine-dev/coolify-relay"
+                "mine-stack1/coolify-relay"
               )
               CURRENT_INDEX=-1
               for i in "${!REPOS[@]}"; do
@@ -516,12 +518,12 @@ jobs:
 
           # 3. Dispatch successor runner across the ring BEFORE releasing ingress
           REPOS=(
-            "ember-ops1/coolify-relay"
             "moss-and-wire/coolify-relay"
             "pixel-crafter1/coolify-relay"
             "12stack-phantom/coolify-relay"
-            "nova-matrix1/coolify-relay"
-            "orbit-devs12/coolify-relay"
+            "ihjjjhknjkj8878/coolify-relay"
+            "nether-mine-dev/coolify-relay"
+            "mine-stack1/coolify-relay"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
