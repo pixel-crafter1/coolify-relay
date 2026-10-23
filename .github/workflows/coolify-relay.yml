@@ -285,7 +285,7 @@ jobs:
             echo "Verifying public Cloudflare tunnel endpoint..."
             CF_ONLINE=false
             for cf_chk in {1..30}; do
-              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://coolify.justsawyou.cyou || echo "000")
+              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 https://coolify.silver-xf.bond || echo "000")
               echo "Public URL check (${cf_chk}/30): HTTP ${CF_STATUS}"
               if [ "$CF_STATUS" != "530" ] && [ "$CF_STATUS" != "000" ]; then
                 echo "SUCCESS: Cloudflare tunnel is publicly active (HTTP ${CF_STATUS})!"
