@@ -164,12 +164,12 @@ jobs:
           echo "Executing fallback dispatch to next ring node with retry_depth=${NEW_DEPTH}..."
 
           REPOS=(
-            "mine-runner1/distributed-load-worker"
-            "pixel-crafter1/distributed-load-worker"
-            "12stack-phantom/distributed-load-worker"
-            "ihjjjhknjkj8878/distributed-load-worker"
-            "mine-stack1/distributed-load-worker"
-            "shaft-mine/distributed-load-worker"
+            "mine-runner1/distributed-matrix-worker"
+            "pixel-crafter1/distributed-matrix-worker"
+            "12stack-phantom/distributed-matrix-worker"
+            "ihjjjhknjkj8878/distributed-matrix-worker"
+            "mine-stack1/distributed-matrix-worker"
+            "shaft-mine/distributed-matrix-worker"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -317,12 +317,12 @@ jobs:
 
           # Cancel predecessor runner run to release GitHub concurrency
           REPOS=(
-            "mine-runner1/distributed-load-worker"
-            "pixel-crafter1/distributed-load-worker"
-            "12stack-phantom/distributed-load-worker"
-            "ihjjjhknjkj8878/distributed-load-worker"
-            "mine-stack1/distributed-load-worker"
-            "shaft-mine/distributed-load-worker"
+            "mine-runner1/distributed-matrix-worker"
+            "pixel-crafter1/distributed-matrix-worker"
+            "12stack-phantom/distributed-matrix-worker"
+            "ihjjjhknjkj8878/distributed-matrix-worker"
+            "mine-stack1/distributed-matrix-worker"
+            "shaft-mine/distributed-matrix-worker"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -534,12 +534,12 @@ jobs:
 
           # 3. Dispatch successor runner across the ring BEFORE releasing ingress
           REPOS=(
-            "mine-runner1/distributed-load-worker"
-            "pixel-crafter1/distributed-load-worker"
-            "12stack-phantom/distributed-load-worker"
-            "ihjjjhknjkj8878/distributed-load-worker"
-            "mine-stack1/distributed-load-worker"
-            "shaft-mine/distributed-load-worker"
+            "mine-runner1/distributed-matrix-worker"
+            "pixel-crafter1/distributed-matrix-worker"
+            "12stack-phantom/distributed-matrix-worker"
+            "ihjjjhknjkj8878/distributed-matrix-worker"
+            "mine-stack1/distributed-matrix-worker"
+            "shaft-mine/distributed-matrix-worker"
           )
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
